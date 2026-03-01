@@ -1,3 +1,4 @@
+pub mod activities_parser;
 pub mod amcache_parser;
 pub mod browser_parser;
 pub mod autorun_parser;
