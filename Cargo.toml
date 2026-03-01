@@ -48,6 +48,9 @@ nt_hive2 = "4.2.4"
 log = "0.4"
 env_logger = "0.11"
 
+# User activity artifact parsing
+cfb = "0.14.0"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
