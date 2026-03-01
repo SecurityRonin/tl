@@ -211,6 +211,25 @@ const FIREWALL_CONNECTION: &[u32] = &[5156, 5157];
 const ACCOUNT_CREATED: u32 = 4720;
 const GROUP_MEMBER_ADD: u32 = 4732;
 
+// Task Scheduler Operational
+const TASK_REGISTERED: u32 = 106;
+const TASK_COMPLETED: u32 = 201;
+const TASK_ACTION_STARTED: u32 = 200;
+
+// WMI-Activity Operational
+const WMI_ACTIVITY_IDS: &[u32] = &[5857, 5858, 5859, 5860, 5861];
+
+// TerminalServices-RDPClient
+const RDP_CLIENT_IDS: &[u32] = &[1024, 1102];
+
+// Windows Defender
+const DEFENDER_DETECTION: u32 = 1116;
+const DEFENDER_ACTION: u32 = 1117;
+
+// SMB share access
+const SHARE_ACCESS: u32 = 5140;
+const SHARE_MAPPED: u32 = 5145;
+
 /// Check if an entry is from Sysmon.
 fn is_sysmon(entry: &EvtxEntry) -> bool {
     entry.provider.contains("Sysmon")
@@ -241,7 +260,9 @@ pub fn map_event_type(entry: &EvtxEntry) -> EventType {
         EventType::ProcessCreate
     } else if SECURITY_SCHEDULED_TASK.contains(&eid) {
         EventType::ScheduledTaskCreate
-    } else if eid == SECURITY_LOG_CLEARED || eid == SYSTEM_LOG_CLEARED {
+    } else if (eid == SECURITY_LOG_CLEARED || eid == SYSTEM_LOG_CLEARED)
+        && !entry.channel.contains("RDPClient")
+    {
         EventType::Other("LogCleared".to_string())
     } else if eid == SYSTEM_SERVICE_INSTALL {
         EventType::ServiceInstall
@@ -257,6 +278,16 @@ pub fn map_event_type(entry: &EvtxEntry) -> EventType {
         EventType::Other("AccountCreated".to_string())
     } else if eid == GROUP_MEMBER_ADD {
         EventType::Other("GroupMemberAdd".to_string())
+    } else if eid == TASK_REGISTERED || eid == TASK_ACTION_STARTED || eid == TASK_COMPLETED {
+        EventType::ScheduledTaskCreate
+    } else if WMI_ACTIVITY_IDS.contains(&eid) {
+        EventType::Other("WmiActivity".to_string())
+    } else if RDP_CLIENT_IDS.contains(&eid) && entry.channel.contains("RDPClient") {
+        EventType::RdpSession
+    } else if eid == DEFENDER_DETECTION || eid == DEFENDER_ACTION {
+        EventType::Other("Defender".to_string())
+    } else if eid == SHARE_ACCESS || eid == SHARE_MAPPED {
+        EventType::Other("ShareAccess".to_string())
     } else {
         EventType::Other(format!("EID:{}", eid))
     }
@@ -293,6 +324,10 @@ pub fn build_description(entry: &EvtxEntry) -> String {
             let name = entry.event_data.get("ServiceName").map(|s| s.as_str()).unwrap_or("?");
             let path = entry.event_data.get("ImagePath").map(|s| s.as_str()).unwrap_or("?");
             format!("[Service] {} -> {}", name, path)
+        }
+        1102 if entry.channel.contains("RDPClient") => {
+            let server = entry.event_data.get("Value").map(|s| s.as_str()).unwrap_or("?");
+            format!("[RDPClient] Connected to {}", server)
         }
         1102 | 104 => {
             format!("[LogCleared] {} on {}", entry.channel, entry.computer)
@@ -382,6 +417,60 @@ pub fn build_description(entry: &EvtxEntry) -> String {
             } else {
                 format!("[Sysmon:Registry] {} -> {} = {}", image, target, details)
             }
+        }
+        // Task Scheduler Operational
+        106 => {
+            let task = entry.event_data.get("TaskName").map(|s| s.as_str()).unwrap_or("?");
+            let user = entry.event_data.get("UserContext").map(|s| s.as_str()).unwrap_or("");
+            format!("[TaskRegistered] {} (user: {})", task, user)
+        }
+        200 => {
+            let task = entry.event_data.get("TaskName").map(|s| s.as_str()).unwrap_or("?");
+            let action = entry.event_data.get("ActionName").map(|s| s.as_str()).unwrap_or("");
+            format!("[TaskStarted] {} -> {}", task, action)
+        }
+        201 => {
+            let task = entry.event_data.get("TaskName").map(|s| s.as_str()).unwrap_or("?");
+            let result = entry.event_data.get("ResultCode").map(|s| s.as_str()).unwrap_or("?");
+            format!("[TaskCompleted] {} (result: {})", task, result)
+        }
+        // WMI-Activity
+        5857..=5861 => {
+            let operation = entry.event_data.get("Operation").map(|s| s.as_str()).unwrap_or("");
+            let query = entry.event_data.get("Query").map(|s| s.as_str())
+                .or_else(|| entry.event_data.get("PossibleCause").map(|s| s.as_str()))
+                .unwrap_or("");
+            format!("[WMI:{}] {} {}", entry.event_id, operation, query)
+        }
+        // RDP Client outbound
+        1024 if entry.channel.contains("RDPClient") => {
+            let server = entry.event_data.get("Value").map(|s| s.as_str()).unwrap_or("?");
+            format!("[RDPClient] Connecting to {}", server)
+        }
+        // Windows Defender
+        1116 => {
+            let threat = entry.event_data.get("Threat Name").map(|s| s.as_str())
+                .or_else(|| entry.event_data.get("ThreatName").map(|s| s.as_str()))
+                .unwrap_or("?");
+            let path = entry.event_data.get("Path").map(|s| s.as_str()).unwrap_or("");
+            format!("[Defender:Detection] {} at {}", threat, path)
+        }
+        1117 => {
+            let threat = entry.event_data.get("Threat Name").map(|s| s.as_str())
+                .or_else(|| entry.event_data.get("ThreatName").map(|s| s.as_str()))
+                .unwrap_or("?");
+            let action = entry.event_data.get("Action Name").map(|s| s.as_str())
+                .or_else(|| entry.event_data.get("ActionName").map(|s| s.as_str()))
+                .unwrap_or("?");
+            format!("[Defender:Action] {} -> {}", threat, action)
+        }
+        // SMB share access
+        5140 | 5145 => {
+            let share = entry.event_data.get("ShareName").map(|s| s.as_str()).unwrap_or("?");
+            let path = entry.event_data.get("RelativeTargetName").map(|s| s.as_str()).unwrap_or("");
+            let user = entry.event_data.get("SubjectUserName").map(|s| s.as_str()).unwrap_or("?");
+            let ip = entry.event_data.get("IpAddress").map(|s| s.as_str()).unwrap_or("-");
+            format!("[Share] {}\\{} by {} from {}", share, path, user, ip)
         }
         _ => {
             format!("[EVT:{}] EID:{} on {}", entry.channel, entry.event_id, entry.computer)
@@ -1090,6 +1179,135 @@ mod tests {
         let desc = build_description(&parsed);
         assert!(desc.contains("injector.exe"), "should contain source: {}", desc);
         assert!(desc.contains("lsass.exe"), "should contain target: {}", desc);
+    }
+
+    // ─── Phase 19: Additional EVTX event tests ────────────────────────────
+
+    fn make_entry(event_id: u32, provider: &str, channel: &str, data: Vec<(&str, &str)>) -> EvtxEntry {
+        let mut event_data = std::collections::HashMap::new();
+        for (k, v) in data {
+            event_data.insert(k.to_string(), v.to_string());
+        }
+        EvtxEntry {
+            event_id,
+            timestamp: chrono::Utc::now(),
+            provider: provider.to_string(),
+            channel: channel.to_string(),
+            computer: "WS01".to_string(),
+            event_data,
+        }
+    }
+
+    #[test]
+    fn test_map_task_registered_106() {
+        let e = make_entry(106, "Microsoft-Windows-TaskScheduler", "TaskScheduler/Operational", vec![]);
+        assert!(matches!(map_event_type(&e), EventType::ScheduledTaskCreate));
+    }
+
+    #[test]
+    fn test_map_task_started_200() {
+        let e = make_entry(200, "Microsoft-Windows-TaskScheduler", "TaskScheduler/Operational", vec![]);
+        assert!(matches!(map_event_type(&e), EventType::ScheduledTaskCreate));
+    }
+
+    #[test]
+    fn test_map_task_completed_201() {
+        let e = make_entry(201, "Microsoft-Windows-TaskScheduler", "TaskScheduler/Operational", vec![]);
+        assert!(matches!(map_event_type(&e), EventType::ScheduledTaskCreate));
+    }
+
+    #[test]
+    fn test_build_description_task_registered() {
+        let e = make_entry(106, "TaskScheduler", "TaskScheduler/Operational",
+            vec![("TaskName", r"\EvilTask"), ("UserContext", "SYSTEM")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[TaskRegistered]"), "got: {}", desc);
+        assert!(desc.contains("EvilTask"), "got: {}", desc);
+    }
+
+    #[test]
+    fn test_build_description_task_completed() {
+        let e = make_entry(201, "TaskScheduler", "TaskScheduler/Operational",
+            vec![("TaskName", r"\UpdateTask"), ("ResultCode", "0")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[TaskCompleted]"), "got: {}", desc);
+        assert!(desc.contains("result: 0"), "got: {}", desc);
+    }
+
+    #[test]
+    fn test_map_wmi_activity_5861() {
+        let e = make_entry(5861, "Microsoft-Windows-WMI-Activity", "WMI-Activity/Operational", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s == "WmiActivity"), "got: {:?}", et);
+    }
+
+    #[test]
+    fn test_build_description_wmi_activity() {
+        let e = make_entry(5861, "WMI-Activity", "WMI-Activity/Operational",
+            vec![("Operation", "ExecQuery"), ("Query", "SELECT * FROM Win32_Process")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[WMI:5861]"), "got: {}", desc);
+        assert!(desc.contains("ExecQuery"), "got: {}", desc);
+    }
+
+    #[test]
+    fn test_map_rdp_client_1024() {
+        let e = make_entry(1024, "Microsoft-Windows-TerminalServices-RDPClient",
+            "Microsoft-Windows-TerminalServices-RDPClient/Operational", vec![]);
+        assert!(matches!(map_event_type(&e), EventType::RdpSession));
+    }
+
+    #[test]
+    fn test_build_description_rdp_client() {
+        let e = make_entry(1024, "TerminalServices-RDPClient",
+            "Microsoft-Windows-TerminalServices-RDPClient/Operational",
+            vec![("Value", "10.0.0.5")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[RDPClient]"), "got: {}", desc);
+        assert!(desc.contains("10.0.0.5"), "got: {}", desc);
+    }
+
+    #[test]
+    fn test_map_defender_1116() {
+        let e = make_entry(1116, "Microsoft-Windows-Windows Defender", "Windows Defender/Operational", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s == "Defender"), "got: {:?}", et);
+    }
+
+    #[test]
+    fn test_build_description_defender_detection() {
+        let e = make_entry(1116, "Windows Defender", "Windows Defender/Operational",
+            vec![("ThreatName", "Trojan:Win32/Emotet"), ("Path", r"C:\Users\admin\malware.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Defender:Detection]"), "got: {}", desc);
+        assert!(desc.contains("Emotet"), "got: {}", desc);
+    }
+
+    #[test]
+    fn test_build_description_defender_action() {
+        let e = make_entry(1117, "Windows Defender", "Windows Defender/Operational",
+            vec![("ThreatName", "Trojan:Win32/Emotet"), ("ActionName", "Quarantine")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Defender:Action]"), "got: {}", desc);
+        assert!(desc.contains("Quarantine"), "got: {}", desc);
+    }
+
+    #[test]
+    fn test_map_share_access_5140() {
+        let e = make_entry(5140, "Microsoft-Windows-Security-Auditing", "Security", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s == "ShareAccess"), "got: {:?}", et);
+    }
+
+    #[test]
+    fn test_build_description_share_access() {
+        let e = make_entry(5140, "Security", "Security",
+            vec![("ShareName", r"\\*\C$"), ("RelativeTargetName", "Windows\\System32"),
+                 ("SubjectUserName", "admin"), ("IpAddress", "10.0.0.1")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Share]"), "got: {}", desc);
+        assert!(desc.contains("C$"), "got: {}", desc);
+        assert!(desc.contains("admin"), "got: {}", desc);
     }
 
     #[test]
