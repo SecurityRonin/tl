@@ -1,5 +1,19 @@
-use anyhow::Result;
+use std::io;
+
+use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::{
+    event::{self, Event, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+
+use tl::collection::provider::CollectionProvider;
+use tl::collection::velociraptor::VelociraptorProvider;
+use tl::parsers::mft_parser;
+use tl::timeline::store::TimelineStore;
+use tl::tui::app::App;
 
 #[derive(Parser)]
 #[command(name = "tl", about = "Rapid forensic triage timeline")]
@@ -19,6 +33,98 @@ struct Cli {
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
-    println!("Opening collection: {}", cli.collection.display());
+
+    // Step 1: Open the collection
+    let provider = VelociraptorProvider::open(&cli.collection)
+        .with_context(|| format!("Failed to open collection: {}", cli.collection.display()))?;
+
+    // Step 2: Discover artifacts
+    let manifest = provider.discover();
+    let meta = provider.metadata();
+
+    // Print artifact discovery summary to stderr (so it doesn't interfere with TUI)
+    eprintln!(
+        "Collection: {} ({})",
+        meta.hostname, meta.collection_timestamp
+    );
+    eprintln!("Source tool: {}", meta.source_tool);
+    eprintln!(
+        "Artifacts found: {} total files",
+        manifest.all_paths.len()
+    );
+    if manifest.has_mft() {
+        eprintln!("  $MFT: found");
+    }
+    if manifest.has_usnjrnl() {
+        eprintln!("  $UsnJrnl: found");
+    }
+    eprintln!(
+        "  Event logs: {}, Prefetch: {}, LNK: {}, Registry hives: {}",
+        manifest.event_logs().len(),
+        manifest.prefetch_files().len(),
+        manifest.lnk_files().len(),
+        manifest.registry_hives().len(),
+    );
+
+    // Step 3: Parse $MFT into TimelineStore
+    let mut store = TimelineStore::new();
+
+    if let Some(ref mft_path) = manifest.mft {
+        eprintln!("Parsing $MFT...");
+        let mft_data = provider
+            .open_file(mft_path)
+            .context("Failed to read $MFT from collection")?;
+        mft_parser::parse_mft(&mft_data, &mut store)
+            .context("Failed to parse $MFT")?;
+        eprintln!("  {} timeline entries from $MFT", store.len());
+    } else {
+        eprintln!("Warning: No $MFT found in collection");
+    }
+
+    // Step 4: Handle export modes
+    if let Some(ref _csv_path) = cli.export_csv {
+        eprintln!("CSV export not yet implemented (coming in Task 1.6)");
+        return Ok(());
+    }
+    if let Some(ref _json_path) = cli.export_json {
+        eprintln!("JSON export not yet implemented");
+        return Ok(());
+    }
+
+    // Step 5: Launch TUI
+    run_tui(store, meta.hostname, meta.collection_timestamp)?;
+
+    Ok(())
+}
+
+fn run_tui(store: TimelineStore, hostname: String, date: String) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new(store, hostname, date);
+
+    loop {
+        terminal.draw(|f| {
+            // Calculate visible rows based on terminal height, minus header(3) + status(1) + table header(1) + margins
+            app.visible_rows = f.area().height.saturating_sub(6) as usize;
+            tl::tui::timeline_view::render(f, &app);
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press {
+                tl::tui::keybindings::handle_key(&mut app, key);
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
 }
