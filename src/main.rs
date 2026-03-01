@@ -113,6 +113,11 @@ fn main() -> Result<()> {
     tl::parsers::mru_parser::parse_mru_lists(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
+    // Parse event logs
+    eprintln!("Parsing event logs...");
+    tl::parsers::evtx_parser::parse_event_logs(&provider, &manifest, &mut store)?;
+    eprintln!("  Timeline now has {} entries", store.len());
+
     store.sort();
 
     // Step 4: Handle export modes
