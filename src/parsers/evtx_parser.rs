@@ -205,6 +205,11 @@ const SECURITY_LOG_CLEARED: u32 = 1102;
 const SYSTEM_LOG_CLEARED: u32 = 104;
 const SYSTEM_SERVICE_INSTALL: u32 = 7045;
 const RDP_SESSION_IDS: &[u32] = &[21, 22, 23, 24, 25];
+const POWERSHELL_SCRIPTBLOCK: u32 = 4104;
+const BITS_TRANSFER_IDS: &[u32] = &[59, 60, 61];
+const FIREWALL_CONNECTION: &[u32] = &[5156, 5157];
+const ACCOUNT_CREATED: u32 = 4720;
+const GROUP_MEMBER_ADD: u32 = 4732;
 
 /// Map a parsed EVTX entry to the appropriate EventType.
 pub fn map_event_type(entry: &EvtxEntry) -> EventType {
@@ -224,6 +229,16 @@ pub fn map_event_type(entry: &EvtxEntry) -> EventType {
         EventType::ServiceInstall
     } else if RDP_SESSION_IDS.contains(&eid) && entry.provider.contains("TerminalServices") {
         EventType::RdpSession
+    } else if eid == POWERSHELL_SCRIPTBLOCK {
+        EventType::Execute
+    } else if BITS_TRANSFER_IDS.contains(&eid) {
+        EventType::BitsTransfer
+    } else if FIREWALL_CONNECTION.contains(&eid) {
+        EventType::NetworkConnection
+    } else if eid == ACCOUNT_CREATED {
+        EventType::Other("AccountCreated".to_string())
+    } else if eid == GROUP_MEMBER_ADD {
+        EventType::Other("GroupMemberAdd".to_string())
     } else {
         EventType::Other(format!("EID:{}", eid))
     }
@@ -268,6 +283,47 @@ pub fn build_description(entry: &EvtxEntry) -> String {
             let user = entry.event_data.get("User").map(|s| s.as_str()).unwrap_or("?");
             let addr = entry.event_data.get("Address").map(|s| s.as_str()).unwrap_or("-");
             format!("[RDP] {} from {} (EID:{})", user, addr, entry.event_id)
+        }
+        4104 => {
+            let script = entry.event_data.get("ScriptBlockText").map(|s| s.as_str()).unwrap_or("?");
+            let path = entry.event_data.get("Path").map(|s| s.as_str()).unwrap_or("");
+            // Truncate long scripts to first 200 chars for readability
+            let truncated = if script.len() > 200 {
+                format!("{}...", &script[..200])
+            } else {
+                script.to_string()
+            };
+            if path.is_empty() {
+                format!("[PowerShell] {}", truncated)
+            } else {
+                format!("[PowerShell] {} -> {}", path, truncated)
+            }
+        }
+        59 | 60 | 61 => {
+            let url = entry.event_data.get("url").map(|s| s.as_str()).unwrap_or("?");
+            let bytes = entry.event_data.get("bytesTransferred").map(|s| s.as_str()).unwrap_or("0");
+            format!("[BITS] {} ({} bytes)", url, bytes)
+        }
+        5156 | 5157 => {
+            let app = entry.event_data.get("Application").map(|s| s.as_str()).unwrap_or("?");
+            let src = entry.event_data.get("SourceAddress").map(|s| s.as_str()).unwrap_or("?");
+            let src_port = entry.event_data.get("SourcePort").map(|s| s.as_str()).unwrap_or("?");
+            let dst = entry.event_data.get("DestAddress").map(|s| s.as_str()).unwrap_or("?");
+            let dst_port = entry.event_data.get("DestPort").map(|s| s.as_str()).unwrap_or("?");
+            let action = if entry.event_id == 5156 { "Allowed" } else { "Blocked" };
+            format!("[Net:{}] {}:{} -> {}:{} ({})", action, src, src_port, dst, dst_port, app)
+        }
+        4720 => {
+            let target = entry.event_data.get("TargetUserName").map(|s| s.as_str()).unwrap_or("?");
+            let domain = entry.event_data.get("TargetDomainName").map(|s| s.as_str()).unwrap_or("");
+            let subject = entry.event_data.get("SubjectUserName").map(|s| s.as_str()).unwrap_or("?");
+            format!("[AccountCreated] {}\\{} by {}", domain, target, subject)
+        }
+        4732 => {
+            let group = entry.event_data.get("TargetUserName").map(|s| s.as_str()).unwrap_or("?");
+            let member = entry.event_data.get("MemberSid").map(|s| s.as_str()).unwrap_or("?");
+            let subject = entry.event_data.get("SubjectUserName").map(|s| s.as_str()).unwrap_or("?");
+            format!("[GroupMemberAdd] {} added to {} by {}", member, group, subject)
         }
         _ => {
             format!("[EVT:{}] EID:{} on {}", entry.channel, entry.event_id, entry.computer)
@@ -618,6 +674,199 @@ mod tests {
         assert_eq!(entry.event_type, EventType::UserLogon);
         assert!(entry.path.contains("admin"));
         assert!(entry.timestamps.evtx_timestamp.is_some());
+    }
+
+    // ─── Phase 11: Enhanced EVTX event fixtures ───────────────────────────────
+
+    fn powershell_scriptblock_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-PowerShell" />
+    <EventID>4104</EventID>
+    <TimeCreated SystemTime="2025-06-15T14:00:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-PowerShell/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="ScriptBlockText">Invoke-Mimikatz -DumpCreds</Data>
+    <Data Name="Path">C:\temp\payload.ps1</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn bits_transfer_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Bits-Client" />
+    <EventID>59</EventID>
+    <TimeCreated SystemTime="2025-06-15T15:00:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-Bits-Client/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="url">https://evil.com/payload.exe</Data>
+    <Data Name="fileTime">2025-06-15T15:00:00.000Z</Data>
+    <Data Name="bytesTransferred">1048576</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn firewall_connection_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" />
+    <EventID>5156</EventID>
+    <TimeCreated SystemTime="2025-06-15T16:00:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Security</Channel>
+  </System>
+  <EventData>
+    <Data Name="Application">\device\harddiskvolume2\windows\system32\svchost.exe</Data>
+    <Data Name="SourceAddress">192.168.1.100</Data>
+    <Data Name="SourcePort">49152</Data>
+    <Data Name="DestAddress">10.0.0.1</Data>
+    <Data Name="DestPort">443</Data>
+    <Data Name="Protocol">6</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn account_created_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" />
+    <EventID>4720</EventID>
+    <TimeCreated SystemTime="2025-06-15T17:00:00.000000Z" />
+    <Computer>DC01</Computer>
+    <Channel>Security</Channel>
+  </System>
+  <EventData>
+    <Data Name="TargetUserName">backdoor_user</Data>
+    <Data Name="TargetDomainName">CORP</Data>
+    <Data Name="SubjectUserName">admin</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn group_membership_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" />
+    <EventID>4732</EventID>
+    <TimeCreated SystemTime="2025-06-15T17:05:00.000000Z" />
+    <Computer>DC01</Computer>
+    <Channel>Security</Channel>
+  </System>
+  <EventData>
+    <Data Name="MemberSid">S-1-5-21-1234-5678-9012-1001</Data>
+    <Data Name="TargetUserName">Administrators</Data>
+    <Data Name="SubjectUserName">admin</Data>
+  </EventData>
+</Event>"#
+    }
+
+    // ─── Phase 11: PowerShell ScriptBlock tests ──────────────────────────────
+
+    #[test]
+    fn test_parse_powershell_scriptblock() {
+        let parsed = parse_evtx_record_xml(powershell_scriptblock_xml()).unwrap();
+        assert_eq!(parsed.event_id, 4104);
+        assert_eq!(parsed.channel, "Microsoft-Windows-PowerShell/Operational");
+        assert!(parsed.event_data.contains_key("ScriptBlockText"));
+    }
+
+    #[test]
+    fn test_map_4104_to_execute() {
+        let parsed = parse_evtx_record_xml(powershell_scriptblock_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::Execute);
+    }
+
+    #[test]
+    fn test_build_description_powershell_scriptblock() {
+        let parsed = parse_evtx_record_xml(powershell_scriptblock_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("PowerShell"), "should contain PowerShell: {}", desc);
+        assert!(desc.contains("Invoke-Mimikatz"), "should contain script text: {}", desc);
+    }
+
+    // ─── Phase 11: BITS transfer tests ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_bits_transfer() {
+        let parsed = parse_evtx_record_xml(bits_transfer_xml()).unwrap();
+        assert_eq!(parsed.event_id, 59);
+        assert!(parsed.event_data.contains_key("url"));
+    }
+
+    #[test]
+    fn test_map_bits_to_bits_transfer() {
+        let parsed = parse_evtx_record_xml(bits_transfer_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::BitsTransfer);
+    }
+
+    #[test]
+    fn test_build_description_bits() {
+        let parsed = parse_evtx_record_xml(bits_transfer_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("BITS"), "should contain BITS: {}", desc);
+        assert!(desc.contains("evil.com"), "should contain URL: {}", desc);
+    }
+
+    // ─── Phase 11: Network connection tests ──────────────────────────────────
+
+    #[test]
+    fn test_parse_firewall_connection() {
+        let parsed = parse_evtx_record_xml(firewall_connection_xml()).unwrap();
+        assert_eq!(parsed.event_id, 5156);
+        assert!(parsed.event_data.contains_key("DestAddress"));
+    }
+
+    #[test]
+    fn test_map_5156_to_network_connection() {
+        let parsed = parse_evtx_record_xml(firewall_connection_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::NetworkConnection);
+    }
+
+    #[test]
+    fn test_build_description_firewall() {
+        let parsed = parse_evtx_record_xml(firewall_connection_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("192.168.1.100"), "should contain src IP: {}", desc);
+        assert!(desc.contains("10.0.0.1"), "should contain dst IP: {}", desc);
+        assert!(desc.contains("443"), "should contain dst port: {}", desc);
+    }
+
+    // ─── Phase 11: Account management tests ──────────────────────────────────
+
+    #[test]
+    fn test_map_4720_to_other_account_created() {
+        let parsed = parse_evtx_record_xml(account_created_xml()).unwrap();
+        let et = map_event_type(&parsed);
+        assert!(matches!(et, EventType::Other(ref s) if s.contains("AccountCreated")),
+            "expected AccountCreated, got {:?}", et);
+    }
+
+    #[test]
+    fn test_build_description_account_created() {
+        let parsed = parse_evtx_record_xml(account_created_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("backdoor_user"), "should contain target user: {}", desc);
+        assert!(desc.contains("admin"), "should contain subject user: {}", desc);
+    }
+
+    #[test]
+    fn test_map_4732_to_other_group_add() {
+        let parsed = parse_evtx_record_xml(group_membership_xml()).unwrap();
+        let et = map_event_type(&parsed);
+        assert!(matches!(et, EventType::Other(ref s) if s.contains("GroupMemberAdd")),
+            "expected GroupMemberAdd, got {:?}", et);
+    }
+
+    #[test]
+    fn test_build_description_group_membership() {
+        let parsed = parse_evtx_record_xml(group_membership_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("Administrators"), "should contain group name: {}", desc);
     }
 
     #[test]
