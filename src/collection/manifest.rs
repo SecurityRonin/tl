@@ -20,6 +20,10 @@ pub struct ArtifactManifest {
     pub scheduled_tasks: Vec<NormalizedPath>,
     pub srum: Vec<NormalizedPath>,
     pub wmi_repository: Vec<NormalizedPath>,
+    pub powershell_history: Vec<NormalizedPath>,
+    pub activities_cache: Vec<NormalizedPath>,
+    pub browser_history: Vec<NormalizedPath>,
+    pub rdp_bitmap_cache: Vec<NormalizedPath>,
     pub all_paths: Vec<NormalizedPath>,
 }
 

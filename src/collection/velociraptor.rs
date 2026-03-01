@@ -181,6 +181,24 @@ fn classify_artifact(path: &NormalizedPath, manifest: &mut ArtifactManifest) {
     else if lower.contains(r"\wbem\repository\") && lower.ends_with("objects.data") {
         manifest.wmi_repository.push(path.clone());
     }
+    // PowerShell console history
+    else if lower.contains("consolehost_history.txt") {
+        manifest.powershell_history.push(path.clone());
+    }
+    // Windows Timeline
+    else if lower.ends_with("activitiescache.db") {
+        manifest.activities_cache.push(path.clone());
+    }
+    // RDP Bitmap Cache
+    else if lower.contains(r"\cache\") && lower.ends_with(".bmc") {
+        manifest.rdp_bitmap_cache.push(path.clone());
+    }
+    // Browser history databases
+    else if (lower.ends_with("history") || lower.ends_with("places.sqlite"))
+        && (lower.contains("chrome") || lower.contains("edge") || lower.contains("firefox") || lower.contains("mozilla"))
+    {
+        manifest.browser_history.push(path.clone());
+    }
 }
 
 fn extract_username_from_path(win_path: &str) -> String {

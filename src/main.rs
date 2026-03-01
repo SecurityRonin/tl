@@ -136,6 +136,7 @@ fn main() -> Result<()> {
     tl::parsers::recycle_bin_parser::parse_recycle_bin(&provider, &manifest, &mut store)?;
     tl::parsers::mru_parser::parse_mru_lists(&provider, &manifest, &mut store)?;
     tl::parsers::user_registry_parser::parse_user_registry(&provider, &manifest, &mut store)?;
+    tl::parsers::posh_history_parser::parse_powershell_history(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     // Parse event logs
