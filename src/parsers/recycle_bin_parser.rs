@@ -1,0 +1,455 @@
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use log::{debug, warn};
+use smallvec::smallvec;
+
+use crate::collection::manifest::ArtifactManifest;
+use crate::collection::provider::CollectionProvider;
+use crate::timeline::entry::*;
+use crate::timeline::store::TimelineStore;
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// Minimum size of a $I file (header + timestamp + at least some path data).
+const MIN_I_FILE_SIZE: usize = 28;
+
+/// Maximum reasonable $I file size (1 MB).
+const MAX_I_FILE_SIZE: usize = 1_000_000;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Convert a Windows FILETIME (100ns intervals since 1601-01-01) to DateTime<Utc>.
+fn filetime_to_datetime(filetime: u64) -> Option<DateTime<Utc>> {
+    if filetime == 0 {
+        return None;
+    }
+    const EPOCH_DIFF: i64 = 11_644_473_600;
+    let secs = (filetime / 10_000_000) as i64 - EPOCH_DIFF;
+    if secs < 0 {
+        return None;
+    }
+    let nanos = ((filetime % 10_000_000) * 100) as u32;
+    DateTime::from_timestamp(secs, nanos)
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    if offset + 4 > data.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]))
+}
+
+fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
+    if offset + 8 > data.len() {
+        return None;
+    }
+    Some(u64::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ]))
+}
+
+/// Decode a UTF-16LE byte slice into a String, stopping at the first null.
+fn decode_utf16le_null_terminated(data: &[u8]) -> String {
+    let u16_iter = data
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+    let chars: Vec<u16> = u16_iter.take_while(|&c| c != 0).collect();
+    String::from_utf16_lossy(&chars)
+}
+
+// ─── ID Generation ───────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static RECYCLEBIN_ID_COUNTER: AtomicU64 = AtomicU64::new(0x5242_0000_0000_0000); // "RB" prefix
+
+fn next_recyclebin_id() -> u64 {
+    RECYCLEBIN_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// ─── Parsed entry ────────────────────────────────────────────────────────────
+
+/// A parsed Recycle Bin $I file entry.
+#[derive(Debug, Clone)]
+pub struct RecycleBinEntry {
+    /// Original file path before deletion.
+    pub original_path: String,
+    /// File size before deletion.
+    pub file_size: u64,
+    /// Timestamp when the file was deleted.
+    pub deletion_time: DateTime<Utc>,
+    /// The $I file path.
+    pub i_file_path: String,
+    /// Format version (1 or 2).
+    pub version: u64,
+}
+
+/// Parse a single $I file.
+///
+/// Format (Windows Vista/7 - version 1):
+///   - Offset 0: Version/Header (u64) = 1
+///   - Offset 8: File size (u64)
+///   - Offset 16: Deletion timestamp (FILETIME, i64 LE)
+///   - Offset 24: Original file path (UTF-16LE, 520 bytes = 260 chars)
+///
+/// Format (Windows 10+ - version 2):
+///   - Offset 0: Version/Header (u64) = 2
+///   - Offset 8: File size (u64)
+///   - Offset 16: Deletion timestamp (FILETIME, i64 LE)
+///   - Offset 24: File name length (u32, in characters including null)
+///   - Offset 28: Original file path (UTF-16LE, variable length)
+pub fn parse_i_file(data: &[u8], i_file_path: &str) -> Result<RecycleBinEntry> {
+    if data.len() < MIN_I_FILE_SIZE {
+        anyhow::bail!("$I file too short: {} bytes", data.len());
+    }
+
+    let version = read_u64_le(data, 0).unwrap_or(0);
+    if version != 1 && version != 2 {
+        anyhow::bail!("Unknown $I file version: {}", version);
+    }
+
+    let file_size = read_u64_le(data, 8).unwrap_or(0);
+
+    let deletion_filetime = read_u64_le(data, 16).unwrap_or(0);
+    let deletion_time = filetime_to_datetime(deletion_filetime)
+        .ok_or_else(|| anyhow::anyhow!("Invalid deletion timestamp in $I file"))?;
+
+    let original_path = match version {
+        1 => {
+            // Version 1: fixed-size path at offset 24, 520 bytes (260 UTF-16 chars)
+            if data.len() < 24 + 4 {
+                anyhow::bail!("$I v1 file too short for path");
+            }
+            let path_end = std::cmp::min(24 + 520, data.len());
+            decode_utf16le_null_terminated(&data[24..path_end])
+        }
+        2 => {
+            // Version 2: variable-size path
+            let name_len = read_u32_le(data, 24).unwrap_or(0) as usize;
+            if name_len == 0 {
+                anyhow::bail!("$I v2 file has zero path length");
+            }
+            let path_start = 28;
+            let path_bytes = name_len * 2; // UTF-16LE = 2 bytes per char
+            if path_start + path_bytes > data.len() {
+                // Try to read what we can
+                let available = data.len() - path_start;
+                if available < 4 {
+                    anyhow::bail!("$I v2 file too short for path data");
+                }
+                decode_utf16le_null_terminated(&data[path_start..])
+            } else {
+                decode_utf16le_null_terminated(&data[path_start..path_start + path_bytes])
+            }
+        }
+        _ => unreachable!(),
+    };
+
+    if original_path.is_empty() {
+        anyhow::bail!("Empty original path in $I file");
+    }
+
+    Ok(RecycleBinEntry {
+        original_path,
+        file_size,
+        deletion_time,
+        i_file_path: i_file_path.to_string(),
+        version,
+    })
+}
+
+// ─── Main Parser ─────────────────────────────────────────────────────────────
+
+/// Parse all Recycle Bin $I files from the collection and populate the timeline store.
+///
+/// For each $I* file in the manifest's recycle_bin list, this extracts:
+/// - Original file path
+/// - Deletion timestamp
+/// - File size
+///
+/// Creates TimelineEntry records with EventType::FileDelete and ArtifactSource::RecycleBin.
+pub fn parse_recycle_bin(
+    provider: &dyn CollectionProvider,
+    manifest: &ArtifactManifest,
+    store: &mut TimelineStore,
+) -> Result<()> {
+    let rb_files = &manifest.recycle_bin;
+    if rb_files.is_empty() {
+        debug!("No Recycle Bin files found in manifest");
+        return Ok(());
+    }
+
+    // Filter for $I files only
+    let i_files: Vec<_> = rb_files
+        .iter()
+        .filter(|p| {
+            let path = p.to_string();
+            let basename = path
+                .rsplit(|c| c == '\\' || c == '/')
+                .next()
+                .unwrap_or("");
+            basename.starts_with("$I")
+        })
+        .collect();
+
+    if i_files.is_empty() {
+        debug!("No $I files found in Recycle Bin manifest entries");
+        return Ok(());
+    }
+
+    debug!("Parsing {} Recycle Bin $I files", i_files.len());
+    let mut parsed_count = 0u32;
+    let mut error_count = 0u32;
+
+    for i_path in &i_files {
+        let data = match provider.open_file(i_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Failed to read $I file {}: {}", i_path, e);
+                error_count += 1;
+                continue;
+            }
+        };
+
+        if data.len() > MAX_I_FILE_SIZE {
+            warn!(
+                "$I file {} is abnormally large ({} bytes), skipping",
+                i_path,
+                data.len()
+            );
+            error_count += 1;
+            continue;
+        }
+
+        let rb_entry = match parse_i_file(&data, &i_path.to_string()) {
+            Ok(entry) => entry,
+            Err(e) => {
+                debug!("Could not parse $I file {}: {}", i_path, e);
+                error_count += 1;
+                continue;
+            }
+        };
+
+        let metadata = EntryMetadata {
+            file_size: Some(rb_entry.file_size),
+            ..EntryMetadata::default()
+        };
+
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_recyclebin_id()),
+            path: rb_entry.original_path.clone(),
+            primary_timestamp: rb_entry.deletion_time,
+            event_type: EventType::FileDelete,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::RecycleBin],
+            anomalies: AnomalyFlags::empty(),
+            metadata,
+        };
+
+        store.push(entry);
+        parsed_count += 1;
+    }
+
+    debug!(
+        "Recycle Bin parsing complete: {} files parsed, {} errors",
+        parsed_count, error_count
+    );
+    Ok(())
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn datetime_to_filetime(dt: DateTime<Utc>) -> u64 {
+        let secs = dt.timestamp() + 11_644_473_600;
+        (secs as u64) * 10_000_000
+    }
+
+    #[test]
+    fn test_filetime_to_datetime() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let ft = datetime_to_filetime(dt);
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result, dt);
+    }
+
+    #[test]
+    fn test_filetime_zero() {
+        assert!(filetime_to_datetime(0).is_none());
+    }
+
+    #[test]
+    fn test_parse_i_file_v1() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let path_str = r"C:\Users\admin\Documents\secret.docx";
+
+        let mut data = vec![0u8; 24 + 520]; // version 1 format
+
+        // Version = 1
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        // File size = 12345
+        data[8..16].copy_from_slice(&12345u64.to_le_bytes());
+        // Deletion timestamp
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        // Original path (UTF-16LE)
+        let path_bytes: Vec<u8> = path_str
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data[24..24 + path_bytes.len()].copy_from_slice(&path_bytes);
+
+        let entry = parse_i_file(&data, r"$Recycle.Bin\$IABC123.docx").unwrap();
+
+        assert_eq!(entry.original_path, path_str);
+        assert_eq!(entry.file_size, 12345);
+        assert_eq!(entry.deletion_time, deletion_time);
+        assert_eq!(entry.version, 1);
+    }
+
+    #[test]
+    fn test_parse_i_file_v2() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 8, 20, 9, 15, 0).unwrap();
+        let path_str = r"C:\Users\admin\Desktop\malware.exe";
+
+        let path_utf16: Vec<u8> = path_str
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let char_count = path_str.encode_utf16().count() + 1; // +1 for null terminator
+
+        let mut data = vec![0u8; 28 + char_count * 2];
+
+        // Version = 2
+        data[0..8].copy_from_slice(&2u64.to_le_bytes());
+        // File size = 999999
+        data[8..16].copy_from_slice(&999999u64.to_le_bytes());
+        // Deletion timestamp
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        // Path length (in characters)
+        data[24..28].copy_from_slice(&(char_count as u32).to_le_bytes());
+        // Original path (UTF-16LE)
+        data[28..28 + path_utf16.len()].copy_from_slice(&path_utf16);
+
+        let entry = parse_i_file(&data, r"$Recycle.Bin\$IXYZ789.exe").unwrap();
+
+        assert_eq!(entry.original_path, path_str);
+        assert_eq!(entry.file_size, 999999);
+        assert_eq!(entry.deletion_time, deletion_time);
+        assert_eq!(entry.version, 2);
+    }
+
+    #[test]
+    fn test_parse_i_file_too_short() {
+        let data = vec![0u8; 10];
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_i_file_unknown_version() {
+        let mut data = vec![0u8; 100];
+        data[0..8].copy_from_slice(&99u64.to_le_bytes());
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_i_file_zero_timestamp() {
+        let mut data = vec![0u8; 24 + 520];
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        // Timestamp left at 0
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_recyclebin_entry_creation() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+
+        let rb_entry = RecycleBinEntry {
+            original_path: r"C:\Users\admin\Documents\evidence.pdf".to_string(),
+            file_size: 54321,
+            deletion_time: dt,
+            i_file_path: r"$Recycle.Bin\$IABC.pdf".to_string(),
+            version: 2,
+        };
+
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_recyclebin_id()),
+            path: rb_entry.original_path.clone(),
+            primary_timestamp: rb_entry.deletion_time,
+            event_type: EventType::FileDelete,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::RecycleBin],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata {
+                file_size: Some(rb_entry.file_size),
+                ..EntryMetadata::default()
+            },
+        };
+
+        assert_eq!(entry.path, r"C:\Users\admin\Documents\evidence.pdf");
+        assert_eq!(entry.event_type, EventType::FileDelete);
+        assert_eq!(entry.primary_timestamp, dt);
+        assert_eq!(entry.metadata.file_size, Some(54321));
+    }
+
+    #[test]
+    fn test_empty_manifest_no_error() {
+        use crate::collection::manifest::ArtifactManifest;
+        let manifest = ArtifactManifest::default();
+        let mut store = TimelineStore::new();
+
+        struct MockProvider;
+        impl CollectionProvider for MockProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("should not be called")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = MockProvider;
+        let result = parse_recycle_bin(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_decode_utf16le_null_terminated() {
+        let s = r"C:\test\file.txt";
+        let mut encoded: Vec<u8> = s
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        encoded.extend_from_slice(&[0, 0]); // null terminator
+        encoded.extend_from_slice(&[0x41, 0x00]); // extra data after null
+
+        let result = decode_utf16le_null_terminated(&encoded);
+        assert_eq!(result, s);
+    }
+}

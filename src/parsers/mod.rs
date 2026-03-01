@@ -4,6 +4,7 @@ pub mod jumplist_parser;
 pub mod lnk_parser;
 pub mod mft_parser;
 pub mod prefetch_parser;
+pub mod recycle_bin_parser;
 pub mod shellbag_parser;
 pub mod shimcache_parser;
 pub mod userassist_parser;
