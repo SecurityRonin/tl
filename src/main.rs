@@ -108,6 +108,11 @@ fn main() -> Result<()> {
     tl::parsers::services_parser::parse_services(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
+    // Parse persistence/autorun artifacts
+    eprintln!("Parsing persistence artifacts...");
+    tl::parsers::autorun_parser::parse_autoruns(&provider, &manifest, &mut store)?;
+    eprintln!("  Timeline now has {} entries", store.len());
+
     // Parse user activity artifacts
     eprintln!("Parsing user activity artifacts...");
     tl::parsers::lnk_parser::parse_lnk_files(&provider, &manifest, &mut store)?;

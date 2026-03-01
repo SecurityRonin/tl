@@ -1,4 +1,5 @@
 pub mod amcache_parser;
+pub mod autorun_parser;
 pub mod bam_parser;
 pub mod evtx_parser;
 pub mod jumplist_parser;
