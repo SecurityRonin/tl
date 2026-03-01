@@ -940,6 +940,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "forensic-rs"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b52fbf6df75a38f126edfb2b6bd8723f53d1af0d6dc09502f608839f0c1ff1a"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "frnsc-prefetch"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a582d06c10d8852f8ac817dff1f7b1b749a7aba234a8bbf0eff9cada727d75d8"
+dependencies = [
+ "crc32fast",
+ "forensic-rs",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2483,6 +2502,8 @@ dependencies = [
  "csv",
  "env_logger",
  "evtx",
+ "forensic-rs",
+ "frnsc-prefetch",
  "libesedb",
  "log",
  "mft",

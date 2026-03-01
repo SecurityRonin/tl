@@ -93,6 +93,63 @@ fn read_ascii_string(data: &[u8], offset: usize, max_len: usize) -> String {
     String::from_utf8_lossy(&slice[..nul]).to_string()
 }
 
+// ─── TrackerDataBlock ────────────────────────────────────────────────────────
+
+/// ExtraData block signature for TrackerDataBlock (MS-SHLLINK 2.5.10).
+const TRACKER_DATA_SIGNATURE: u32 = 0xA000_0003;
+
+/// TrackerDataBlock size is always 0x60 (96 bytes).
+const TRACKER_DATA_BLOCK_SIZE: u32 = 0x60;
+
+/// Distributed tracking data extracted from LNK ExtraData.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerData {
+    /// NetBIOS name of the machine where the link target was last known to reside.
+    pub machine_id: String,
+    /// MAC address extracted from the birth Droid ObjectID (UUID v1 node field).
+    pub mac_address: [u8; 6],
+}
+
+/// Parse a TrackerDataBlock from a 96-byte buffer.
+///
+/// Layout (MS-SHLLINK 2.5.10):
+///   offset 0:  BlockSize     (4 bytes) = 0x00000060
+///   offset 4:  BlockSignature(4 bytes) = 0xA0000003
+///   offset 8:  Length        (4 bytes) = 0x00000058
+///   offset 12: Version       (4 bytes) = 0x00000000
+///   offset 16: MachineID     (16 bytes, null-terminated ASCII)
+///   offset 32: Droid         (32 bytes: VolumeID GUID + ObjectID GUID)
+///   offset 64: DroidBirth    (32 bytes: VolumeID GUID + ObjectID GUID)
+///
+/// MAC address is in the last 6 bytes of the DroidBirth ObjectID (UUID v1 node).
+pub fn parse_tracker_data_block(data: &[u8]) -> Option<TrackerData> {
+    if data.len() < 96 {
+        return None;
+    }
+    let signature = read_u32_le(data, 4)?;
+    if signature != TRACKER_DATA_SIGNATURE {
+        return None;
+    }
+
+    let machine_id = read_ascii_string(data, 16, 16);
+
+    // DroidBirth ObjectID starts at offset 80 (second GUID in DroidBirth).
+    // UUID v1 node (MAC) is the last 6 bytes of the 16-byte UUID: offset 80+10=90.
+    let mac = [
+        data[90], data[91], data[92], data[93], data[94], data[95],
+    ];
+
+    Some(TrackerData { machine_id, mac_address: mac })
+}
+
+/// Format a 6-byte MAC address as a colon-separated hex string.
+pub fn format_mac_address(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 // ─── LNK header flags ────────────────────────────────────────────────────────
 
 /// LinkFlags bits we care about.
@@ -130,6 +187,8 @@ pub struct LnkInfo {
     pub target_file_size: u32,
     /// The source LNK file path.
     pub lnk_path: String,
+    /// Distributed tracker data (MachineID, MAC address) from ExtraData.
+    pub tracker_data: Option<TrackerData>,
 }
 
 // ─── ID Generation ───────────────────────────────────────────────────────────
@@ -244,24 +303,29 @@ pub fn parse_lnk_data(data: &[u8], lnk_path: &str) -> Result<LnkInfo> {
         }
     }
 
-    // Parse StringData to try to get relative path if we don't have a target path yet
-    if target_path.is_none() {
-        let is_unicode = (link_flags & IS_UNICODE) != 0;
-        let mut str_offset = offset;
+    // Parse StringData: always traverse all fields to reach ExtraData position.
+    let is_unicode = (link_flags & IS_UNICODE) != 0;
+    let char_size: usize = if is_unicode { 2 } else { 1 };
 
-        // Skip name string if present
-        if (link_flags & HAS_NAME) != 0 {
-            if let Some(count) = read_u16_le(data, str_offset) {
-                let char_size = if is_unicode { 2 } else { 1 };
-                str_offset += 2 + count as usize * char_size;
-            }
+    // Helper: skip one CountCharacters + String field, return new offset.
+    let skip_string_field = |data: &[u8], off: usize, cs: usize| -> usize {
+        if off + 2 > data.len() {
+            return off;
         }
+        let count = read_u16_le(data, off).unwrap_or(0) as usize;
+        off + 2 + count * cs
+    };
 
-        // Read relative path if present
-        if (link_flags & HAS_RELATIVE_PATH) != 0 && str_offset + 2 <= data.len() {
-            if let Some(count) = read_u16_le(data, str_offset) {
-                let char_size = if is_unicode { 2 } else { 1 };
-                let str_start = str_offset + 2;
+    // Skip NAME_STRING if present
+    if (link_flags & HAS_NAME) != 0 {
+        offset = skip_string_field(data, offset, char_size);
+    }
+
+    // Read RELATIVE_PATH if present (use it as target_path fallback)
+    if (link_flags & HAS_RELATIVE_PATH) != 0 {
+        if target_path.is_none() && offset + 2 <= data.len() {
+            if let Some(count) = read_u16_le(data, offset) {
+                let str_start = offset + 2;
                 let str_len = count as usize * char_size;
                 if str_start + str_len <= data.len() && count > 0 {
                     let path = if is_unicode {
@@ -276,6 +340,35 @@ pub fn parse_lnk_data(data: &[u8], lnk_path: &str) -> Result<LnkInfo> {
                 }
             }
         }
+        offset = skip_string_field(data, offset, char_size);
+    }
+
+    // Skip WORKING_DIR, ARGUMENTS, ICON_LOCATION
+    if (link_flags & HAS_WORKING_DIR) != 0 {
+        offset = skip_string_field(data, offset, char_size);
+    }
+    if (link_flags & HAS_ARGUMENTS) != 0 {
+        offset = skip_string_field(data, offset, char_size);
+    }
+    if (link_flags & HAS_ICON_LOCATION) != 0 {
+        offset = skip_string_field(data, offset, char_size);
+    }
+
+    // Scan ExtraData blocks for TrackerDataBlock
+    let mut tracker_data: Option<TrackerData> = None;
+    while offset + 8 <= data.len() {
+        let block_size = read_u32_le(data, offset).unwrap_or(0) as usize;
+        if block_size < 4 {
+            break; // Terminal block
+        }
+        if offset + block_size > data.len() {
+            break;
+        }
+        let signature = read_u32_le(data, offset + 4).unwrap_or(0);
+        if signature == TRACKER_DATA_SIGNATURE && block_size as u32 == TRACKER_DATA_BLOCK_SIZE {
+            tracker_data = parse_tracker_data_block(&data[offset..offset + block_size]);
+        }
+        offset += block_size;
     }
 
     Ok(LnkInfo {
@@ -287,6 +380,7 @@ pub fn parse_lnk_data(data: &[u8], lnk_path: &str) -> Result<LnkInfo> {
         drive_type,
         target_file_size: file_size,
         lnk_path: lnk_path.to_string(),
+        tracker_data,
     })
 }
 
@@ -364,6 +458,14 @@ pub fn parse_lnk_files(
         let target_path = lnk_info
             .target_path
             .unwrap_or_else(|| lnk_path.to_string());
+
+        // Append tracker info (MachineID + MAC) if present
+        let target_path = if let Some(ref tracker) = lnk_info.tracker_data {
+            let mac = format_mac_address(&tracker.mac_address);
+            format!("{} (via {}, MAC: {})", target_path, tracker.machine_id, mac)
+        } else {
+            target_path
+        };
 
         let mut timestamps = TimestampSet::default();
         timestamps.lnk_target_created = lnk_info.target_created;
@@ -633,6 +735,152 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── TrackerDataBlock tests ───────────────────────────────────────────
+
+    /// Build a 96-byte TrackerDataBlock for testing.
+    fn build_tracker_block(machine_id: &str, mac: [u8; 6]) -> Vec<u8> {
+        let mut block = vec![0u8; 96];
+        block[0..4].copy_from_slice(&TRACKER_DATA_BLOCK_SIZE.to_le_bytes());
+        block[4..8].copy_from_slice(&TRACKER_DATA_SIGNATURE.to_le_bytes());
+        block[8..12].copy_from_slice(&0x58u32.to_le_bytes()); // Length
+        // Version = 0 (already zero)
+        let id_bytes = machine_id.as_bytes();
+        let copy_len = std::cmp::min(id_bytes.len(), 15); // leave room for null
+        block[16..16 + copy_len].copy_from_slice(&id_bytes[..copy_len]);
+        // MAC in DroidBirth ObjectID: bytes 90..96
+        block[90..96].copy_from_slice(&mac);
+        block
+    }
+
+    #[test]
+    fn test_parse_tracker_data_block_valid() {
+        let mac = [0x08, 0x00, 0x27, 0x3A, 0xCE, 0x83];
+        let block = build_tracker_block("DESKTOP-ABC", mac);
+        let tracker = parse_tracker_data_block(&block).unwrap();
+        assert_eq!(tracker.machine_id, "DESKTOP-ABC");
+        assert_eq!(tracker.mac_address, mac);
+    }
+
+    #[test]
+    fn test_parse_tracker_data_block_bad_signature() {
+        let mut block = vec![0u8; 96];
+        block[0..4].copy_from_slice(&0x60u32.to_le_bytes());
+        block[4..8].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        assert!(parse_tracker_data_block(&block).is_none());
+    }
+
+    #[test]
+    fn test_parse_tracker_data_block_too_short() {
+        let block = vec![0u8; 50];
+        assert!(parse_tracker_data_block(&block).is_none());
+    }
+
+    #[test]
+    fn test_format_mac_address() {
+        assert_eq!(
+            format_mac_address(&[0x08, 0x00, 0x27, 0x3A, 0xCE, 0x83]),
+            "08:00:27:3a:ce:83"
+        );
+        assert_eq!(
+            format_mac_address(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            "ff:ff:ff:ff:ff:ff"
+        );
+    }
+
+    #[test]
+    fn test_parse_lnk_with_tracker_block() {
+        use chrono::TimeZone;
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let accessed = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+
+        // Header with no optional sections (flags = 0)
+        let mut data = build_lnk_header(
+            datetime_to_filetime(created),
+            datetime_to_filetime(accessed),
+            datetime_to_filetime(written),
+            5000,
+            0,
+        );
+
+        // Append TrackerDataBlock as ExtraData
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        data.extend_from_slice(&build_tracker_block("WORKSTATION1", mac));
+
+        // Terminal block
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        let tracker = info.tracker_data.as_ref().unwrap();
+        assert_eq!(tracker.machine_id, "WORKSTATION1");
+        assert_eq!(tracker.mac_address, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_lnk_no_tracker_block() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            0,
+        );
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert!(info.tracker_data.is_none());
+    }
+
+    #[test]
+    fn test_tracker_data_in_timeline_path() {
+        use chrono::TimeZone;
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+
+        let mut data = build_lnk_header(
+            datetime_to_filetime(written),
+            datetime_to_filetime(written),
+            datetime_to_filetime(written),
+            1000,
+            HAS_LINK_INFO,
+        );
+
+        // Minimal LinkInfo with local base path
+        let target_path = b"C:\\Windows\\System32\\cmd.exe\0";
+        let volume_id_size = 16u32;
+        let local_base_path_offset = 28u32 + volume_id_size;
+        let link_info_size = local_base_path_offset as usize + target_path.len();
+
+        data.extend_from_slice(&(link_info_size as u32).to_le_bytes());
+        data.extend_from_slice(&28u32.to_le_bytes());
+        data.extend_from_slice(&0x01u32.to_le_bytes());
+        data.extend_from_slice(&28u32.to_le_bytes());
+        data.extend_from_slice(&local_base_path_offset.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        data.extend_from_slice(&volume_id_size.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0xABCDu32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        data.extend_from_slice(target_path);
+
+        // TrackerDataBlock
+        let mac = [0x08, 0x00, 0x27, 0xAB, 0xCD, 0xEF];
+        data.extend_from_slice(&build_tracker_block("SUSPECT-PC", mac));
+
+        // Terminal block
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert_eq!(info.target_path, Some(r"C:\Windows\System32\cmd.exe".to_string()));
+        let tracker = info.tracker_data.as_ref().unwrap();
+        assert_eq!(tracker.machine_id, "SUSPECT-PC");
+        assert_eq!(format_mac_address(&tracker.mac_address), "08:00:27:ab:cd:ef");
+    }
+
+    // ─── Original tests ─────────────────────────────────────────────────────
 
     #[test]
     fn test_decode_utf16le() {
