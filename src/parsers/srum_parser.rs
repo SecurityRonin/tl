@@ -53,6 +53,58 @@ pub struct SrumNetworkEntry {
     pub interface_luid: u64,
 }
 
+/// A parsed SRUM network connectivity entry.
+#[derive(Debug, Clone)]
+pub struct SrumConnectivityEntry {
+    pub app_id: String,
+    pub user_sid: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub connected_time: u32,
+    pub interface_luid: u64,
+}
+
+// ─── Human-readable byte formatting ─────────────────────────────────
+
+/// Format a byte count as a human-readable string (B, KB, MB, GB).
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let b = bytes as f64;
+    if bytes == 0 {
+        "0 B".to_string()
+    } else if b < KB {
+        format!("{} B", bytes)
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
+// ─── IdMap resolution ────────────────────────────────────────────────
+
+/// Resolve a libesedb Value to a string using an IdMap lookup table.
+///
+/// If the value is a string (Text/LargeText), return it directly.
+/// If it's a numeric type (I32/U32), look up in the map.
+/// Falls back to "ID:<n>" for unmapped integers, "?" for null/other.
+pub fn resolve_id(value: &libesedb::Value, map: &std::collections::HashMap<i32, String>) -> String {
+    match value {
+        libesedb::Value::Text(s) | libesedb::Value::LargeText(s) => s.clone(),
+        libesedb::Value::I32(n) => {
+            map.get(n).cloned().unwrap_or_else(|| format!("ID:{}", n))
+        }
+        libesedb::Value::U32(n) => {
+            map.get(&(*n as i32)).cloned().unwrap_or_else(|| format!("ID:{}", n))
+        }
+        _ => "?".to_string(),
+    }
+}
+
 // ─── FILETIME conversion ─────────────────────────────────────────────────────
 
 /// Convert a Windows FILETIME (100-ns intervals since 1601-01-01) to DateTime<Utc>.
@@ -67,40 +119,135 @@ pub fn filetime_to_datetime(ft: u64) -> Option<chrono::DateTime<chrono::Utc>> {
 
 // ─── ESE Database Parsing ────────────────────────────────────────────────────
 
+/// Build a column-name → index lookup for an ESE table.
+fn build_col_index(table: &libesedb::Table) -> std::collections::HashMap<String, usize> {
+    let columns: Vec<_> = match table.iter_columns() {
+        Ok(iter) => iter.filter_map(|c| c.ok()).collect(),
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let mut map = std::collections::HashMap::new();
+    for (i, col) in columns.iter().enumerate() {
+        if let Ok(name) = col.name() {
+            map.insert(name.to_lowercase(), i);
+        }
+    }
+    map
+}
+
+/// Get a column index by case-insensitive name from the column map.
+fn col(map: &std::collections::HashMap<String, usize>, name: &str) -> Option<usize> {
+    map.get(&name.to_lowercase()).copied()
+}
+
+/// Parse the SruDbIdMapTable to build numeric-ID → name lookup maps.
+///
+/// The IdMap table maps numeric IDs used in other SRUM tables to actual
+/// application paths (as UTF-16LE in IdBlob) and user SIDs (as binary SID).
+fn parse_id_map(db: &libesedb::EseDb) -> std::collections::HashMap<i32, String> {
+    let mut map = std::collections::HashMap::new();
+
+    let table = match db.table_by_name("SruDbIdMapTable") {
+        Ok(t) => t,
+        Err(_) => {
+            debug!("SruDbIdMapTable not found, IDs will not be resolved");
+            return map;
+        }
+    };
+
+    let cols = build_col_index(&table);
+    let idx_col = col(&cols, "IdIndex");
+    let blob_col = col(&cols, "IdBlob");
+
+    if idx_col.is_none() || blob_col.is_none() {
+        debug!("SruDbIdMapTable missing expected columns");
+        return map;
+    }
+
+    let records = match table.iter_records() {
+        Ok(r) => r,
+        Err(_) => return map,
+    };
+
+    for rec_result in records {
+        let rec = match rec_result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let values: Vec<_> = match rec.iter_values() {
+            Ok(iter) => iter.map(|v| v.unwrap_or_default()).collect(),
+            Err(_) => continue,
+        };
+
+        let id = idx_col
+            .and_then(|i| values.get(i))
+            .and_then(|v| v.to_i32());
+
+        let id = match id {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // IdBlob is typically Binary or LargeBinary containing UTF-16LE
+        let name = blob_col.and_then(|i| values.get(i)).and_then(|v| {
+            // Try text first (some versions store as text)
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+            // Try binary (UTF-16LE encoded app path or binary SID)
+            if let Some(bytes) = v.as_bytes() {
+                if bytes.len() >= 2 {
+                    // Try UTF-16LE decode (application paths)
+                    let u16s: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let decoded = String::from_utf16_lossy(&u16s)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    if !decoded.is_empty()
+                        && decoded.chars().all(|c| !c.is_control() || c == '\\')
+                    {
+                        return Some(decoded);
+                    }
+                }
+            }
+            None
+        });
+
+        if let Some(name) = name {
+            map.insert(id, name);
+        }
+    }
+
+    debug!("SruDbIdMapTable: {} entries resolved", map.len());
+    map
+}
+
 /// Parse SRUM entries from an ESE database file on disk.
 ///
 /// Opens the SRUDB.dat file using libesedb and extracts records from
-/// the Application Resource Usage and Network Data Usage tables.
+/// the Application Resource Usage, Network Data Usage, and Network
+/// Connectivity tables. Resolves numeric IDs via SruDbIdMapTable.
 pub fn parse_srum_from_ese(
     path: &str,
-) -> Result<(Vec<SrumAppEntry>, Vec<SrumNetworkEntry>)> {
+) -> Result<(Vec<SrumAppEntry>, Vec<SrumNetworkEntry>, Vec<SrumConnectivityEntry>)> {
     let db = libesedb::EseDb::open(path)
         .map_err(|e| anyhow::anyhow!("Failed to open SRUM database: {}", e))?;
 
+    // Build IdMap for resolving numeric AppId/UserId references
+    let id_map = parse_id_map(&db);
+
     let mut app_entries = Vec::new();
     let mut net_entries = Vec::new();
+    let mut conn_entries = Vec::new();
 
     // Parse Application Resource Usage table
     if let Ok(table) = db.table_by_name(APP_RESOURCE_USAGE_TABLE) {
         debug!("Parsing SRUM Application Resource Usage table");
-        let columns: Vec<_> = match table.iter_columns() {
-            Ok(iter) => iter.filter_map(|c| c.ok()).collect(),
-            Err(_) => Vec::new(),
-        };
-
-        // Build column index by name
-        let col_idx = |name: &str| -> Option<i32> {
-            columns.iter().position(|c| {
-                c.name().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
-            }).map(|i| i as i32)
-        };
-
-        let ts_col = col_idx("TimeStamp");
-        let app_col = col_idx("AppId");
-        let user_col = col_idx("UserId");
-        let fg_col = col_idx("ForegroundCycleTime");
-        let bg_col = col_idx("BackgroundCycleTime");
-        let face_col = col_idx("FaceTime");
+        let cols = build_col_index(&table);
 
         if let Ok(records) = table.iter_records() {
             for rec_result in records {
@@ -110,14 +257,12 @@ pub fn parse_srum_from_ese(
                 };
 
                 let values: Vec<_> = match rec.iter_values() {
-                    Ok(iter) => iter
-                        .map(|v| v.unwrap_or_default())
-                        .collect(),
+                    Ok(iter) => iter.map(|v| v.unwrap_or_default()).collect(),
                     Err(_) => continue,
                 };
 
-                let timestamp = ts_col
-                    .and_then(|i| values.get(i as usize))
+                let timestamp = col(&cols, "timestamp")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .and_then(filetime_to_datetime);
 
@@ -126,30 +271,28 @@ pub fn parse_srum_from_ese(
                     None => continue,
                 };
 
-                let app_id = app_col
-                    .and_then(|i| values.get(i as usize))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string();
+                let app_id = col(&cols, "appid")
+                    .and_then(|i| values.get(i))
+                    .map(|v| resolve_id(v, &id_map))
+                    .unwrap_or_else(|| "?".to_string());
 
-                let user_sid = user_col
-                    .and_then(|i| values.get(i as usize))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let user_sid = col(&cols, "userid")
+                    .and_then(|i| values.get(i))
+                    .map(|v| resolve_id(v, &id_map))
+                    .unwrap_or_default();
 
-                let fg = fg_col
-                    .and_then(|i| values.get(i as usize))
+                let fg = col(&cols, "foregroundcycletime")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .unwrap_or(0);
 
-                let bg = bg_col
-                    .and_then(|i| values.get(i as usize))
+                let bg = col(&cols, "backgroundcycletime")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .unwrap_or(0);
 
-                let face = face_col
-                    .and_then(|i| values.get(i as usize))
+                let face = col(&cols, "facetime")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .unwrap_or(0);
 
@@ -170,23 +313,7 @@ pub fn parse_srum_from_ese(
     // Parse Network Data Usage table
     if let Ok(table) = db.table_by_name(NETWORK_DATA_USAGE_TABLE) {
         debug!("Parsing SRUM Network Data Usage table");
-        let columns: Vec<_> = match table.iter_columns() {
-            Ok(iter) => iter.filter_map(|c| c.ok()).collect(),
-            Err(_) => Vec::new(),
-        };
-
-        let col_idx = |name: &str| -> Option<i32> {
-            columns.iter().position(|c| {
-                c.name().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
-            }).map(|i| i as i32)
-        };
-
-        let ts_col = col_idx("TimeStamp");
-        let app_col = col_idx("AppId");
-        let user_col = col_idx("UserId");
-        let sent_col = col_idx("BytesSent");
-        let recv_col = col_idx("BytesRecvd");
-        let luid_col = col_idx("InterfaceLuid");
+        let cols = build_col_index(&table);
 
         if let Ok(records) = table.iter_records() {
             for rec_result in records {
@@ -196,14 +323,12 @@ pub fn parse_srum_from_ese(
                 };
 
                 let values: Vec<_> = match rec.iter_values() {
-                    Ok(iter) => iter
-                        .map(|v| v.unwrap_or_default())
-                        .collect(),
+                    Ok(iter) => iter.map(|v| v.unwrap_or_default()).collect(),
                     Err(_) => continue,
                 };
 
-                let timestamp = ts_col
-                    .and_then(|i| values.get(i as usize))
+                let timestamp = col(&cols, "timestamp")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .and_then(filetime_to_datetime);
 
@@ -212,30 +337,28 @@ pub fn parse_srum_from_ese(
                     None => continue,
                 };
 
-                let app_id = app_col
-                    .and_then(|i| values.get(i as usize))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string();
+                let app_id = col(&cols, "appid")
+                    .and_then(|i| values.get(i))
+                    .map(|v| resolve_id(v, &id_map))
+                    .unwrap_or_else(|| "?".to_string());
 
-                let user_sid = user_col
-                    .and_then(|i| values.get(i as usize))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let user_sid = col(&cols, "userid")
+                    .and_then(|i| values.get(i))
+                    .map(|v| resolve_id(v, &id_map))
+                    .unwrap_or_default();
 
-                let sent = sent_col
-                    .and_then(|i| values.get(i as usize))
+                let sent = col(&cols, "bytessent")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .unwrap_or(0);
 
-                let recv = recv_col
-                    .and_then(|i| values.get(i as usize))
+                let recv = col(&cols, "bytesrecvd")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .unwrap_or(0);
 
-                let luid = luid_col
-                    .and_then(|i| values.get(i as usize))
+                let luid = col(&cols, "interfaceluid")
+                    .and_then(|i| values.get(i))
                     .and_then(|v| v.to_u64())
                     .unwrap_or(0);
 
@@ -253,12 +376,73 @@ pub fn parse_srum_from_ese(
         debug!("SRUM Network Data Usage table not found");
     }
 
+    // Parse Network Connectivity table
+    if let Ok(table) = db.table_by_name(NETWORK_CONNECTIVITY_TABLE) {
+        debug!("Parsing SRUM Network Connectivity table");
+        let cols = build_col_index(&table);
+
+        if let Ok(records) = table.iter_records() {
+            for rec_result in records {
+                let rec = match rec_result {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                let values: Vec<_> = match rec.iter_values() {
+                    Ok(iter) => iter.map(|v| v.unwrap_or_default()).collect(),
+                    Err(_) => continue,
+                };
+
+                let timestamp = col(&cols, "timestamp")
+                    .and_then(|i| values.get(i))
+                    .and_then(|v| v.to_u64())
+                    .and_then(filetime_to_datetime);
+
+                let timestamp = match timestamp {
+                    Some(ts) => ts,
+                    None => continue,
+                };
+
+                let app_id = col(&cols, "appid")
+                    .and_then(|i| values.get(i))
+                    .map(|v| resolve_id(v, &id_map))
+                    .unwrap_or_else(|| "?".to_string());
+
+                let user_sid = col(&cols, "userid")
+                    .and_then(|i| values.get(i))
+                    .map(|v| resolve_id(v, &id_map))
+                    .unwrap_or_default();
+
+                let connected = col(&cols, "connectedtime")
+                    .and_then(|i| values.get(i))
+                    .and_then(|v| v.to_u32())
+                    .unwrap_or(0);
+
+                let luid = col(&cols, "interfaceluid")
+                    .and_then(|i| values.get(i))
+                    .and_then(|v| v.to_u64())
+                    .unwrap_or(0);
+
+                conn_entries.push(SrumConnectivityEntry {
+                    app_id,
+                    user_sid,
+                    timestamp,
+                    connected_time: connected,
+                    interface_luid: luid,
+                });
+            }
+        }
+    } else {
+        debug!("SRUM Network Connectivity table not found");
+    }
+
     debug!(
-        "SRUM: {} app entries, {} network entries",
+        "SRUM: {} app, {} network, {} connectivity entries",
         app_entries.len(),
-        net_entries.len()
+        net_entries.len(),
+        conn_entries.len()
     );
-    Ok((app_entries, net_entries))
+    Ok((app_entries, net_entries, conn_entries))
 }
 
 // ─── Main Parser ─────────────────────────────────────────────────────────────
@@ -291,7 +475,7 @@ pub fn parse_srum(
         tmp.flush()?;
 
         let tmp_path = tmp.path().to_string_lossy().to_string();
-        let (app_entries, net_entries) = match parse_srum_from_ese(&tmp_path) {
+        let (app_entries, net_entries, conn_entries) = match parse_srum_from_ese(&tmp_path) {
             Ok(entries) => entries,
             Err(e) => {
                 warn!("Failed to parse SRUM database: {}", e);
@@ -300,10 +484,11 @@ pub fn parse_srum(
         };
 
         debug!(
-            "SRUM from {}: {} app, {} network entries",
+            "SRUM from {}: {} app, {} network, {} connectivity entries",
             srum_path,
             app_entries.len(),
-            net_entries.len()
+            net_entries.len(),
+            conn_entries.len()
         );
 
         for app in &app_entries {
@@ -328,7 +513,8 @@ pub fn parse_srum(
         for net in &net_entries {
             let desc = format!(
                 "[SRUM:Net] {} user:{} sent:{} recv:{}",
-                net.app_id, net.user_sid, net.bytes_sent, net.bytes_received,
+                net.app_id, net.user_sid,
+                format_bytes(net.bytes_sent), format_bytes(net.bytes_received),
             );
 
             store.push(TimelineEntry {
@@ -342,10 +528,27 @@ pub fn parse_srum(
                 metadata: EntryMetadata::default(),
             });
         }
+
+        for conn in &conn_entries {
+            let desc = format!(
+                "[SRUM:Conn] {} user:{} connected:{}s",
+                conn.app_id, conn.user_sid, conn.connected_time,
+            );
+
+            store.push(TimelineEntry {
+                entity_id: EntityId::Generated(next_srum_id()),
+                path: desc,
+                primary_timestamp: conn.timestamp,
+                event_type: EventType::NetworkConnection,
+                timestamps: TimestampSet::default(),
+                sources: smallvec![ArtifactSource::Srum],
+                anomalies: AnomalyFlags::empty(),
+                metadata: EntryMetadata::default(),
+            });
+        }
     }
 
-    Ok(()
-    )
+    Ok(())
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -447,7 +650,8 @@ mod tests {
 
         let desc = format!(
             "[SRUM:Net] {} user:{} sent:{} recv:{}",
-            net.app_id, net.user_sid, net.bytes_sent, net.bytes_received,
+            net.app_id, net.user_sid,
+            format_bytes(net.bytes_sent), format_bytes(net.bytes_received),
         );
 
         let entry = TimelineEntry {
@@ -463,13 +667,166 @@ mod tests {
 
         assert_eq!(entry.event_type, EventType::NetworkConnection);
         assert!(entry.path.contains("malware.exe"));
-        assert!(entry.path.contains("1048576"));
+        assert!(entry.path.contains("1.0 MB"), "got: {}", entry.path);
+    }
+
+    // ─── format_bytes tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn test_format_bytes_small() {
+        assert_eq!(format_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn test_format_bytes_kilobytes() {
+        assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn test_format_bytes_megabytes() {
+        assert_eq!(format_bytes(2_411_724), "2.3 MB");
+    }
+
+    #[test]
+    fn test_format_bytes_gigabytes() {
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
+    }
+
+    #[test]
+    fn test_format_bytes_exact_kb() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+    }
+
+    // ─── resolve_id tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_id_from_string_value() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Text("chrome.exe".to_string());
+        assert_eq!(resolve_id(&val, &map), "chrome.exe");
+    }
+
+    #[test]
+    fn test_resolve_id_from_int_with_map() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(42, "powershell.exe".to_string());
+        let val = libesedb::Value::I32(42);
+        assert_eq!(resolve_id(&val, &map), "powershell.exe");
+    }
+
+    #[test]
+    fn test_resolve_id_from_int_without_map() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::I32(99);
+        assert_eq!(resolve_id(&val, &map), "ID:99");
+    }
+
+    #[test]
+    fn test_resolve_id_from_large_text() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::LargeText("svchost.exe".to_string());
+        assert_eq!(resolve_id(&val, &map), "svchost.exe");
+    }
+
+    #[test]
+    fn test_resolve_id_null_value() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Null(());
+        assert_eq!(resolve_id(&val, &map), "?");
+    }
+
+    // ─── SrumConnectivityEntry tests ─────────────────────────────────────
+
+    #[test]
+    fn test_srum_connectivity_entry_creation() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 8, 0, 0).unwrap();
+        let entry = SrumConnectivityEntry {
+            app_id: "svchost.exe".to_string(),
+            user_sid: "S-1-5-18".to_string(),
+            timestamp: ts,
+            connected_time: 3600,
+            interface_luid: 0x0600_0001_0000_0000,
+        };
+        assert_eq!(entry.connected_time, 3600);
+        assert_eq!(entry.app_id, "svchost.exe");
+    }
+
+    #[test]
+    fn test_srum_connectivity_timeline_entry() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 8, 0, 0).unwrap();
+        let conn = SrumConnectivityEntry {
+            app_id: "explorer.exe".to_string(),
+            user_sid: "S-1-5-21-1234".to_string(),
+            timestamp: ts,
+            connected_time: 7200,
+            interface_luid: 0,
+        };
+
+        let desc = format!(
+            "[SRUM:Conn] {} user:{} connected:{}s",
+            conn.app_id, conn.user_sid, conn.connected_time,
+        );
+
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_srum_id()),
+            path: desc.clone(),
+            primary_timestamp: conn.timestamp,
+            event_type: EventType::NetworkConnection,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Srum],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+
+        assert_eq!(entry.event_type, EventType::NetworkConnection);
+        assert!(entry.path.contains("SRUM:Conn"));
+        assert!(entry.path.contains("7200s"));
+    }
+
+    // ─── Enhanced formatting tests ───────────────────────────────────────
+
+    #[test]
+    fn test_srum_net_entry_with_human_bytes() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let net = SrumNetworkEntry {
+            app_id: "malware.exe".to_string(),
+            user_sid: "S-1-5-21-1234".to_string(),
+            timestamp: ts,
+            bytes_sent: 1048576,
+            bytes_received: 2097152,
+            interface_luid: 0,
+        };
+
+        let desc = format!(
+            "[SRUM:Net] {} user:{} sent:{} recv:{}",
+            net.app_id, net.user_sid,
+            format_bytes(net.bytes_sent), format_bytes(net.bytes_received),
+        );
+
+        assert!(desc.contains("sent:1.0 MB"), "got: {}", desc);
+        assert!(desc.contains("recv:2.0 MB"), "got: {}", desc);
     }
 
     #[test]
     fn test_parse_srum_from_ese_invalid_path() {
         let result = parse_srum_from_ese("/nonexistent/srudb.dat");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_srum_from_ese_returns_three_tuple() {
+        // Verify the return type is (app, net, conn) by destructuring
+        // Using invalid path - we just need to confirm the type compiles
+        let result = parse_srum_from_ese("/nonexistent/srudb.dat");
+        assert!(result.is_err());
+        // If this compiles, the return type is correct
+        let _: Result<(Vec<SrumAppEntry>, Vec<SrumNetworkEntry>, Vec<SrumConnectivityEntry>)> =
+            parse_srum_from_ese("/also/nonexistent");
     }
 
     #[test]
