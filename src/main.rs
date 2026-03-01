@@ -107,6 +107,7 @@ fn main() -> Result<()> {
     eprintln!("Parsing user activity artifacts...");
     tl::parsers::lnk_parser::parse_lnk_files(&provider, &manifest, &mut store)?;
     tl::parsers::jumplist_parser::parse_jump_lists(&provider, &manifest, &mut store)?;
+    tl::parsers::userassist_parser::parse_userassist(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     store.sort();

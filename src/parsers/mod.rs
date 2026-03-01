@@ -5,4 +5,5 @@ pub mod lnk_parser;
 pub mod mft_parser;
 pub mod prefetch_parser;
 pub mod shimcache_parser;
+pub mod userassist_parser;
 pub mod usn_parser;
