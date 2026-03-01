@@ -116,6 +116,7 @@ fn main() -> Result<()> {
     // Parse event logs
     eprintln!("Parsing event logs...");
     tl::parsers::evtx_parser::parse_event_logs(&provider, &manifest, &mut store)?;
+    tl::parsers::schtask_parser::parse_scheduled_tasks(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     store.sort();
