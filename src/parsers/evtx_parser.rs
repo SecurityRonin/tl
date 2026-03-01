@@ -211,9 +211,27 @@ const FIREWALL_CONNECTION: &[u32] = &[5156, 5157];
 const ACCOUNT_CREATED: u32 = 4720;
 const GROUP_MEMBER_ADD: u32 = 4732;
 
+/// Check if an entry is from Sysmon.
+fn is_sysmon(entry: &EvtxEntry) -> bool {
+    entry.provider.contains("Sysmon")
+}
+
 /// Map a parsed EVTX entry to the appropriate EventType.
 pub fn map_event_type(entry: &EvtxEntry) -> EventType {
     let eid = entry.event_id;
+
+    // Sysmon events use low EIDs that would collide with other logs,
+    // so check provider first
+    if is_sysmon(entry) {
+        return match eid {
+            1 => EventType::ProcessCreate,
+            3 => EventType::NetworkConnection,
+            8 => EventType::Other("RemoteThread".to_string()),
+            11 => EventType::FileCreate,
+            12 | 13 | 14 => EventType::RegistryModify,
+            _ => EventType::Other(format!("Sysmon:{}", eid)),
+        };
+    }
 
     if SECURITY_LOGON.contains(&eid) {
         EventType::UserLogon
@@ -324,6 +342,46 @@ pub fn build_description(entry: &EvtxEntry) -> String {
             let member = entry.event_data.get("MemberSid").map(|s| s.as_str()).unwrap_or("?");
             let subject = entry.event_data.get("SubjectUserName").map(|s| s.as_str()).unwrap_or("?");
             format!("[GroupMemberAdd] {} added to {} by {}", member, group, subject)
+        }
+        // Sysmon events
+        1 if is_sysmon(entry) => {
+            let image = entry.event_data.get("Image").map(|s| s.as_str()).unwrap_or("?");
+            let cmdline = entry.event_data.get("CommandLine").map(|s| s.as_str()).unwrap_or("");
+            let user = entry.event_data.get("User").map(|s| s.as_str()).unwrap_or("?");
+            let parent = entry.event_data.get("ParentImage").map(|s| s.as_str()).unwrap_or("");
+            if cmdline.is_empty() {
+                format!("[Sysmon:Process] {} (parent: {}, user: {})", image, parent, user)
+            } else {
+                format!("[Sysmon:Process] {} -> {} (parent: {}, user: {})", image, cmdline, parent, user)
+            }
+        }
+        3 if is_sysmon(entry) => {
+            let image = entry.event_data.get("Image").map(|s| s.as_str()).unwrap_or("?");
+            let src_ip = entry.event_data.get("SourceIp").map(|s| s.as_str()).unwrap_or("?");
+            let src_port = entry.event_data.get("SourcePort").map(|s| s.as_str()).unwrap_or("?");
+            let dst_ip = entry.event_data.get("DestinationIp").map(|s| s.as_str()).unwrap_or("?");
+            let dst_port = entry.event_data.get("DestinationPort").map(|s| s.as_str()).unwrap_or("?");
+            format!("[Sysmon:Net] {} {}:{} -> {}:{}", image, src_ip, src_port, dst_ip, dst_port)
+        }
+        8 if is_sysmon(entry) => {
+            let src = entry.event_data.get("SourceImage").map(|s| s.as_str()).unwrap_or("?");
+            let target = entry.event_data.get("TargetImage").map(|s| s.as_str()).unwrap_or("?");
+            format!("[Sysmon:RemoteThread] {} -> {}", src, target)
+        }
+        11 if is_sysmon(entry) => {
+            let image = entry.event_data.get("Image").map(|s| s.as_str()).unwrap_or("?");
+            let target = entry.event_data.get("TargetFilename").map(|s| s.as_str()).unwrap_or("?");
+            format!("[Sysmon:FileCreate] {} created {}", image, target)
+        }
+        12 | 13 | 14 if is_sysmon(entry) => {
+            let image = entry.event_data.get("Image").map(|s| s.as_str()).unwrap_or("?");
+            let target = entry.event_data.get("TargetObject").map(|s| s.as_str()).unwrap_or("?");
+            let details = entry.event_data.get("Details").map(|s| s.as_str()).unwrap_or("");
+            if details.is_empty() {
+                format!("[Sysmon:Registry] {} -> {}", image, target)
+            } else {
+                format!("[Sysmon:Registry] {} -> {} = {}", image, target, details)
+            }
         }
         _ => {
             format!("[EVT:{}] EID:{} on {}", entry.channel, entry.event_id, entry.computer)
@@ -867,6 +925,171 @@ mod tests {
         let parsed = parse_evtx_record_xml(group_membership_xml()).unwrap();
         let desc = build_description(&parsed);
         assert!(desc.contains("Administrators"), "should contain group name: {}", desc);
+    }
+
+    // ─── Phase 13: Sysmon event fixtures ────────────────────────────────────
+
+    fn sysmon_process_create_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" Guid="{5770385F-C22A-43E0-BF4C-06F5698FFBD9}" />
+    <EventID>1</EventID>
+    <TimeCreated SystemTime="2025-06-15T12:00:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="Image">C:\Windows\System32\cmd.exe</Data>
+    <Data Name="CommandLine">cmd.exe /c whoami</Data>
+    <Data Name="User">CORP\admin</Data>
+    <Data Name="ParentImage">C:\Windows\explorer.exe</Data>
+    <Data Name="ParentCommandLine">C:\Windows\explorer.exe</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn sysmon_network_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" />
+    <EventID>3</EventID>
+    <TimeCreated SystemTime="2025-06-15T12:30:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="Image">C:\Windows\System32\powershell.exe</Data>
+    <Data Name="User">CORP\admin</Data>
+    <Data Name="SourceIp">10.0.0.50</Data>
+    <Data Name="SourcePort">52431</Data>
+    <Data Name="DestinationIp">203.0.113.1</Data>
+    <Data Name="DestinationPort">443</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn sysmon_file_create_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" />
+    <EventID>11</EventID>
+    <TimeCreated SystemTime="2025-06-15T13:00:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="Image">C:\Windows\System32\powershell.exe</Data>
+    <Data Name="TargetFilename">C:\temp\payload.exe</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn sysmon_registry_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" />
+    <EventID>13</EventID>
+    <TimeCreated SystemTime="2025-06-15T13:30:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="Image">C:\Windows\System32\reg.exe</Data>
+    <Data Name="TargetObject">HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\backdoor</Data>
+    <Data Name="Details">C:\temp\evil.exe</Data>
+  </EventData>
+</Event>"#
+    }
+
+    fn sysmon_create_remote_thread_xml() -> &'static str {
+        r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" />
+    <EventID>8</EventID>
+    <TimeCreated SystemTime="2025-06-15T14:30:00.000000Z" />
+    <Computer>WORKSTATION01</Computer>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+  </System>
+  <EventData>
+    <Data Name="SourceImage">C:\temp\injector.exe</Data>
+    <Data Name="TargetImage">C:\Windows\System32\lsass.exe</Data>
+  </EventData>
+</Event>"#
+    }
+
+    // ─── Phase 13: Sysmon tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_map_sysmon_1_to_process_create() {
+        let parsed = parse_evtx_record_xml(sysmon_process_create_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::ProcessCreate);
+    }
+
+    #[test]
+    fn test_build_description_sysmon_process() {
+        let parsed = parse_evtx_record_xml(sysmon_process_create_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("Sysmon"), "should contain Sysmon: {}", desc);
+        assert!(desc.contains("cmd.exe"), "should contain image: {}", desc);
+        assert!(desc.contains("whoami"), "should contain cmdline: {}", desc);
+    }
+
+    #[test]
+    fn test_map_sysmon_3_to_network_connection() {
+        let parsed = parse_evtx_record_xml(sysmon_network_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::NetworkConnection);
+    }
+
+    #[test]
+    fn test_build_description_sysmon_network() {
+        let parsed = parse_evtx_record_xml(sysmon_network_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("203.0.113.1"), "should contain dst IP: {}", desc);
+        assert!(desc.contains("443"), "should contain dst port: {}", desc);
+        assert!(desc.contains("powershell"), "should contain image: {}", desc);
+    }
+
+    #[test]
+    fn test_map_sysmon_11_to_file_create() {
+        let parsed = parse_evtx_record_xml(sysmon_file_create_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::FileCreate);
+    }
+
+    #[test]
+    fn test_build_description_sysmon_file_create() {
+        let parsed = parse_evtx_record_xml(sysmon_file_create_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("payload.exe"), "should contain target file: {}", desc);
+    }
+
+    #[test]
+    fn test_map_sysmon_13_to_registry_modify() {
+        let parsed = parse_evtx_record_xml(sysmon_registry_xml()).unwrap();
+        assert_eq!(map_event_type(&parsed), EventType::RegistryModify);
+    }
+
+    #[test]
+    fn test_build_description_sysmon_registry() {
+        let parsed = parse_evtx_record_xml(sysmon_registry_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("CurrentVersion\\Run"), "should contain reg path: {}", desc);
+        assert!(desc.contains("evil.exe"), "should contain details: {}", desc);
+    }
+
+    #[test]
+    fn test_map_sysmon_8_to_other_remote_thread() {
+        let parsed = parse_evtx_record_xml(sysmon_create_remote_thread_xml()).unwrap();
+        let et = map_event_type(&parsed);
+        assert!(matches!(et, EventType::Other(ref s) if s.contains("RemoteThread")),
+            "expected RemoteThread, got {:?}", et);
+    }
+
+    #[test]
+    fn test_build_description_sysmon_remote_thread() {
+        let parsed = parse_evtx_record_xml(sysmon_create_remote_thread_xml()).unwrap();
+        let desc = build_description(&parsed);
+        assert!(desc.contains("injector.exe"), "should contain source: {}", desc);
+        assert!(desc.contains("lsass.exe"), "should contain target: {}", desc);
     }
 
     #[test]
