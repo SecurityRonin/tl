@@ -103,6 +103,11 @@ fn main() -> Result<()> {
     tl::parsers::bam_parser::parse_bam(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
+    // Parse user activity artifacts
+    eprintln!("Parsing user activity artifacts...");
+    tl::parsers::lnk_parser::parse_lnk_files(&provider, &manifest, &mut store)?;
+    eprintln!("  Timeline now has {} entries", store.len());
+
     store.sort();
 
     // Step 4: Handle export modes
