@@ -61,6 +61,9 @@ quick-xml = "0.37"
 libesedb = "0.2"
 tempfile = "3"
 
+# SQLite parsing (browser history, ActivitiesCache)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
