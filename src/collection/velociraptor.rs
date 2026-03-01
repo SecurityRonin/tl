@@ -173,6 +173,14 @@ fn classify_artifact(path: &NormalizedPath, manifest: &mut ArtifactManifest) {
     else if lower.contains(r"system32\tasks\") && !lower.ends_with(r"\tasks") {
         manifest.scheduled_tasks.push(path.clone());
     }
+    // SRUM database
+    else if lower.contains(r"\sru\") && lower.ends_with("srudb.dat") {
+        manifest.srum.push(path.clone());
+    }
+    // WMI repository
+    else if lower.contains(r"\wbem\repository\") && lower.ends_with("objects.data") {
+        manifest.wmi_repository.push(path.clone());
+    }
 }
 
 fn extract_username_from_path(win_path: &str) -> String {

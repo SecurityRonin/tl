@@ -11,6 +11,7 @@ pub mod recycle_bin_parser;
 pub mod schtask_parser;
 pub mod services_parser;
 pub mod shellbag_parser;
+pub mod srum_parser;
 pub mod shimcache_parser;
 pub mod userassist_parser;
 pub mod usn_parser;

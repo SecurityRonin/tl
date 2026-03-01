@@ -18,6 +18,8 @@ pub struct ArtifactManifest {
     pub amcache: Vec<NormalizedPath>,
     pub recycle_bin: Vec<NormalizedPath>,
     pub scheduled_tasks: Vec<NormalizedPath>,
+    pub srum: Vec<NormalizedPath>,
+    pub wmi_repository: Vec<NormalizedPath>,
     pub all_paths: Vec<NormalizedPath>,
 }
 

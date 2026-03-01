@@ -80,6 +80,8 @@ pub enum ArtifactSource {
     Registry(String),
     RecycleBin,
     ScheduledTask,
+    Srum,
+    Wmi,
 }
 
 impl fmt::Display for ArtifactSource {
@@ -100,6 +102,8 @@ impl fmt::Display for ArtifactSource {
             ArtifactSource::Registry(name) => write!(f, "REG:{}", name),
             ArtifactSource::RecycleBin => write!(f, "RB"),
             ArtifactSource::ScheduledTask => write!(f, "TSK"),
+            ArtifactSource::Srum => write!(f, "SRUM"),
+            ArtifactSource::Wmi => write!(f, "WMI"),
         }
     }
 }

@@ -57,6 +57,10 @@ evtx = "0.11"
 # XML parsing
 quick-xml = "0.37"
 
+# ESE database parsing (SRUM)
+libesedb = "0.2"
+tempfile = "3"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
