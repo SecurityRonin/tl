@@ -105,6 +105,7 @@ fn main() -> Result<()> {
     tl::parsers::amcache_parser::parse_amcache(&provider, &manifest, &mut store)?;
     tl::parsers::shimcache_parser::parse_shimcache(&provider, &manifest, &mut store)?;
     tl::parsers::bam_parser::parse_bam(&provider, &manifest, &mut store)?;
+    tl::parsers::services_parser::parse_services(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     // Parse user activity artifacts
