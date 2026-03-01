@@ -12,6 +12,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tl::collection::provider::CollectionProvider;
 use tl::collection::velociraptor::VelociraptorProvider;
 use tl::parsers::mft_parser;
+use tl::parsers::usn_parser;
 use tl::timeline::store::TimelineStore;
 use tl::tui::app::App;
 
@@ -80,6 +81,21 @@ fn main() -> Result<()> {
     } else {
         eprintln!("Warning: No $MFT found in collection");
     }
+
+    // Step 3b: Parse $UsnJrnl:$J into TimelineStore
+    if let Some(ref usn_path) = manifest.usnjrnl_j {
+        eprintln!("Parsing $UsnJrnl:$J...");
+        let usn_data = provider
+            .open_file(usn_path)
+            .context("Failed to read $UsnJrnl:$J from collection")?;
+        eprintln!("  $UsnJrnl size: {} bytes", usn_data.len());
+        let records = usn_parser::parse_usn_journal(&usn_data)
+            .context("Failed to parse $UsnJrnl:$J")?;
+        eprintln!("  {} USN records parsed", records.len());
+        usn_parser::merge_usn_to_timeline(&records, &mut store);
+        eprintln!("  Timeline now has {} entries", store.len());
+    }
+    store.sort();
 
     // Step 4: Handle export modes
     if let Some(ref csv_path) = cli.export_csv {
