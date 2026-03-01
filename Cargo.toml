@@ -1,0 +1,51 @@
+[package]
+name = "tl"
+version = "0.1.0"
+edition = "2021"
+description = "Rapid forensic triage timeline tool"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Collection handling
+zip = "2"
+percent-encoding = "2"
+
+# NTFS
+mft = "0.6"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+nt-time = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+bodyfile = "0.1"
+smallvec = { version = "1", features = ["serde"] }
+bitflags = "2"
+
+# Parallelism
+rayon = "1"
+
+# Search
+regex = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
