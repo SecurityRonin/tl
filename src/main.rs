@@ -103,7 +103,11 @@ fn main() -> Result<()> {
         let records = usn_parser::parse_usn_journal(&usn_data)
             .context("Failed to parse $UsnJrnl:$J")?;
         eprintln!("  {} USN records parsed", records.len());
-        usn_parser::merge_usn_to_timeline(&records, &mut store);
+
+        // Build MFT path resolver from existing MFT entries for full path reconstruction
+        let resolver = usn_parser::MftPathResolver::from_store(&store);
+        eprintln!("  MFT path resolver: {} entries", resolver.len());
+        usn_parser::merge_usn_to_timeline_with_paths(&records, &mut store, &resolver);
         eprintln!("  Timeline now has {} entries", store.len());
     }
     // Parse execution evidence

@@ -1,7 +1,10 @@
 use std::path::Path;
 use tl::collection::provider::CollectionProvider;
 use tl::collection::velociraptor::VelociraptorProvider;
-use tl::parsers::usn_parser::{parse_usn_journal, merge_usn_to_timeline, UsnReason};
+use tl::parsers::usn_parser::{
+    parse_usn_journal, merge_usn_to_timeline, merge_usn_to_timeline_with_paths,
+    UsnReason, FileAttributes, MftPathResolver,
+};
 use tl::timeline::entry::*;
 use tl::timeline::store::TimelineStore;
 
@@ -103,7 +106,7 @@ fn test_parse_synthetic_usn_record_file_create() {
     assert_eq!(r.usn, 1024);
     assert_eq!(r.filename, "test_file.txt");
     assert!(r.reason.contains(UsnReason::FILE_CREATE));
-    assert_eq!(r.file_attributes, 0x20);
+    assert!(r.file_attributes.contains(FileAttributes::ARCHIVE));
     // Timestamp should be within 1 second of what we set
     let diff = (r.timestamp - ts).num_seconds().abs();
     assert!(diff < 2, "Timestamp mismatch: expected ~{}, got {}", ts, r.timestamp);
@@ -514,12 +517,14 @@ fn test_merge_real_usnjrnl_to_timeline() {
     let mft_count = store.len();
     eprintln!("MFT entries: {}", mft_count);
 
-    // Parse and merge USN
+    // Parse and merge USN with MFT path resolution
     let usn_path = manifest.usnjrnl_j.as_ref().expect("No $UsnJrnl:$J found");
     let usn_data = provider.open_file(usn_path).unwrap();
     let records = parse_usn_journal(&usn_data).unwrap();
     let usn_count = records.len();
-    merge_usn_to_timeline(&records, &mut store);
+    let resolver = MftPathResolver::from_store(&store);
+    eprintln!("MFT path resolver: {} entries", resolver.len());
+    merge_usn_to_timeline_with_paths(&records, &mut store, &resolver);
 
     eprintln!("USN records: {}", usn_count);
     eprintln!("Total timeline entries: {}", store.len());
@@ -536,4 +541,85 @@ fn test_merge_real_usnjrnl_to_timeline() {
         .collect();
     assert!(!usn_entries.is_empty(), "Should have USN-sourced entries");
     eprintln!("USN-sourced timeline entries: {}", usn_entries.len());
+
+    // Verify path resolution enriched at least some entries with full paths
+    let resolved_count = usn_entries.iter()
+        .filter(|e| e.path.contains('\\'))
+        .count();
+    eprintln!("USN entries with resolved paths: {}/{}", resolved_count, usn_entries.len());
+    assert!(resolved_count > 0, "MFT path resolution should resolve at least some USN entries");
+}
+
+// ─── V3 record integration tests ────────────────────────────────────────────
+
+#[test]
+fn test_parse_v3_record_integration() {
+    use chrono::{TimeZone, Utc};
+
+    let ts = Utc.with_ymd_and_hms(2025, 9, 1, 10, 0, 0).unwrap();
+    let filetime = datetime_to_filetime(ts);
+
+    // Build V3 record with 128-bit file references
+    let utf16: Vec<u16> = "refs_data.txt".encode_utf16().collect();
+    let fn_bytes: Vec<u8> = utf16.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let filename_offset: u16 = 0x4C;
+    let raw_len = 0x4C + fn_bytes.len();
+    let record_len = ((raw_len + 7) / 8) * 8;
+    let mut buf = vec![0u8; record_len];
+
+    buf[0x00..0x04].copy_from_slice(&(record_len as u32).to_le_bytes());
+    buf[0x04..0x06].copy_from_slice(&3u16.to_le_bytes()); // V3
+    // FileReferenceNumber (u128) - lower 64 bits = 42
+    buf[0x08..0x10].copy_from_slice(&42u64.to_le_bytes());
+    buf[0x10..0x18].copy_from_slice(&0u64.to_le_bytes());
+    // ParentFileReferenceNumber (u128) - lower 64 bits = 5
+    buf[0x18..0x20].copy_from_slice(&5u64.to_le_bytes());
+    buf[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+    buf[0x28..0x30].copy_from_slice(&3000i64.to_le_bytes()); // usn
+    buf[0x30..0x38].copy_from_slice(&filetime.to_le_bytes());
+    buf[0x38..0x3C].copy_from_slice(&0x100u32.to_le_bytes()); // FILE_CREATE
+    buf[0x44..0x48].copy_from_slice(&0x20u32.to_le_bytes()); // ARCHIVE
+    buf[0x48..0x4A].copy_from_slice(&(fn_bytes.len() as u16).to_le_bytes());
+    buf[0x4A..0x4C].copy_from_slice(&filename_offset.to_le_bytes());
+    buf[0x4C..0x4C + fn_bytes.len()].copy_from_slice(&fn_bytes);
+
+    let records = parse_usn_journal(&buf).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].filename, "refs_data.txt");
+    assert_eq!(records[0].mft_entry, 42);
+    assert_eq!(records[0].mft_sequence, 0); // V3 doesn't use NTFS sequence split
+
+    // Merge with path resolver
+    let mut resolver = MftPathResolver::new();
+    resolver.insert(5, r"D:\ReFS\Share".to_string());
+
+    let mut store = TimelineStore::new();
+    merge_usn_to_timeline_with_paths(&records, &mut store, &resolver);
+
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.get(0).unwrap().path, r"D:\ReFS\Share\refs_data.txt");
+    assert_eq!(store.get(0).unwrap().event_type, EventType::FileCreate);
+}
+
+#[test]
+fn test_file_attributes_display_in_context() {
+    use chrono::{TimeZone, Utc};
+
+    let ts = Utc.with_ymd_and_hms(2025, 8, 10, 12, 0, 0).unwrap();
+    let data = build_usn_record_v2(
+        42, 3, 5, 1, 1024,
+        datetime_to_filetime(ts),
+        0x00000100, // FILE_CREATE
+        "hidden_system.dll",
+        0x06, // HIDDEN | SYSTEM
+    );
+
+    let records = parse_usn_journal(&data).unwrap();
+    assert_eq!(records.len(), 1);
+    let display = format!("{}", records[0].file_attributes);
+    assert!(display.contains("HIDDEN"), "got: {}", display);
+    assert!(display.contains("SYSTEM"), "got: {}", display);
+
+    let reason_display = format!("{}", records[0].reason);
+    assert!(reason_display.contains("FILE_CREATE"), "got: {}", reason_display);
 }
