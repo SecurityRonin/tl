@@ -82,8 +82,11 @@ fn main() -> Result<()> {
     }
 
     // Step 4: Handle export modes
-    if let Some(ref _csv_path) = cli.export_csv {
-        eprintln!("CSV export not yet implemented (coming in Task 1.6)");
+    if let Some(ref csv_path) = cli.export_csv {
+        let file = std::fs::File::create(csv_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        tl::export::csv_export::export_csv(&store, &mut writer)?;
+        eprintln!("Exported {} entries to {}", store.len(), csv_path.display());
         return Ok(());
     }
     if let Some(ref _json_path) = cli.export_json {
