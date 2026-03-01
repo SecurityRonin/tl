@@ -221,11 +221,21 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let content = match app.mode {
         AppMode::Search => {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled("/", Style::default().fg(Color::Yellow)),
                 Span::raw(&app.search_query),
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            ])
+            ];
+            if !app.status_message.is_empty() {
+                spans.push(Span::raw("  "));
+                let color = if app.search_results.is_empty() && !app.search_query.is_empty() {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
+                spans.push(Span::styled(&app.status_message, Style::default().fg(color)));
+            }
+            Line::from(spans)
         }
         AppMode::Normal => {
             let position = if app.store.is_empty() {
@@ -247,7 +257,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::styled(msg, Style::default().fg(Color::Green)),
                 Span::styled(
-                    "  q:quit  j/k:nav  J/K:x10  Enter:detail  /:search  x:export",
+                    "  q:quit  j/k:nav  J/K:x10  Enter:detail  /:search  n/N:next/prev  x:export",
                     Style::default().fg(Color::DarkGray),
                 ),
             ])

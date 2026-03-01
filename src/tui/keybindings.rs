@@ -69,9 +69,17 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // Enter search mode
         KeyCode::Char('/') => {
+            app.begin_search();
             app.mode = AppMode::Search;
-            app.search_query.clear();
-            app.status_message.clear();
+        }
+
+        // Next search match
+        KeyCode::Char('n') => {
+            app.next_match();
+        }
+        // Previous search match
+        KeyCode::Char('N') => {
+            app.prev_match();
         }
 
         // Export placeholder
@@ -85,27 +93,28 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
 fn handle_search_mode(app: &mut App, key: KeyEvent) {
     match key.code {
-        // Execute search and return to Normal
+        // Confirm search — stay at current match
         KeyCode::Enter => {
-            app.execute_search();
+            app.confirm_search();
             app.mode = AppMode::Normal;
         }
 
-        // Cancel search
+        // Cancel search — restore pre-search position
         KeyCode::Esc => {
-            app.search_query.clear();
+            app.cancel_search();
             app.mode = AppMode::Normal;
-            app.status_message.clear();
         }
 
-        // Delete character
+        // Delete character — re-search incrementally
         KeyCode::Backspace => {
             app.search_query.pop();
+            app.incremental_search();
         }
 
-        // Append character
+        // Type character — search incrementally as you type
         KeyCode::Char(c) => {
             app.search_query.push(c);
+            app.incremental_search();
         }
 
         _ => {}

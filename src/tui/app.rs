@@ -15,6 +15,8 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<usize>,
     pub search_cursor: usize,
+    pub pre_search_index: usize,
+    pub pre_search_offset: usize,
     pub status_message: String,
     pub should_quit: bool,
     pub visible_rows: usize,
@@ -33,6 +35,8 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_cursor: 0,
+            pre_search_index: 0,
+            pre_search_offset: 0,
             status_message: String::new(),
             should_quit: false,
             visible_rows: 20,
@@ -95,16 +99,39 @@ impl App {
         self.store.get(self.selected_index)
     }
 
-    /// Execute a case-insensitive path substring search and jump to the first result.
-    pub fn execute_search(&mut self) {
+    /// Save position before entering search mode (so Esc can restore it).
+    pub fn begin_search(&mut self) {
+        self.pre_search_index = self.selected_index;
+        self.pre_search_offset = self.scroll_offset;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_cursor = 0;
+        self.status_message.clear();
+    }
+
+    /// Cancel search and restore the pre-search position.
+    pub fn cancel_search(&mut self) {
+        self.selected_index = self.pre_search_index;
+        self.scroll_offset = self.pre_search_offset;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.status_message.clear();
+    }
+
+    /// Incremental search: rebuild results and jump to the nearest forward match
+    /// from the pre-search position. Called on every keystroke in search mode.
+    pub fn incremental_search(&mut self) {
         let query = self.search_query.to_lowercase();
+        self.search_results.clear();
+
         if query.is_empty() {
-            self.search_results.clear();
-            self.status_message = String::new();
+            // Restore position when query is cleared
+            self.selected_index = self.pre_search_index;
+            self.scroll_offset = self.pre_search_offset;
+            self.status_message.clear();
             return;
         }
 
-        self.search_results.clear();
         for (i, entry) in self.store.entries().enumerate() {
             if entry.path.to_lowercase().contains(&query) {
                 self.search_results.push(i);
@@ -113,15 +140,60 @@ impl App {
 
         if self.search_results.is_empty() {
             self.status_message = format!("No matches for \"{}\"", self.search_query);
-        } else {
-            self.search_cursor = 0;
-            self.selected_index = self.search_results[0];
-            self.ensure_visible();
-            self.status_message = format!(
-                "Match 1/{} for \"{}\"",
-                self.search_results.len(),
-                self.search_query
-            );
+            return;
         }
+
+        // Find the nearest match at or after the pre-search position
+        let start = self.pre_search_index;
+        self.search_cursor = self.search_results
+            .iter()
+            .position(|&idx| idx >= start)
+            .unwrap_or(0); // wrap to first match if none after
+
+        self.selected_index = self.search_results[self.search_cursor];
+        self.ensure_visible();
+        self.update_search_status();
+    }
+
+    /// Confirm search — stay at current match position, return to normal mode.
+    pub fn confirm_search(&mut self) {
+        if !self.search_results.is_empty() {
+            self.update_search_status();
+        }
+    }
+
+    /// Jump to the next search match (n in normal mode).
+    pub fn next_match(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        self.search_cursor = (self.search_cursor + 1) % self.search_results.len();
+        self.selected_index = self.search_results[self.search_cursor];
+        self.ensure_visible();
+        self.update_search_status();
+    }
+
+    /// Jump to the previous search match (N in normal mode).
+    pub fn prev_match(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        if self.search_cursor == 0 {
+            self.search_cursor = self.search_results.len() - 1;
+        } else {
+            self.search_cursor -= 1;
+        }
+        self.selected_index = self.search_results[self.search_cursor];
+        self.ensure_visible();
+        self.update_search_status();
+    }
+
+    fn update_search_status(&mut self) {
+        self.status_message = format!(
+            "{}/{} \"{}\"",
+            self.search_cursor + 1,
+            self.search_results.len(),
+            self.search_query
+        );
     }
 }
