@@ -124,6 +124,7 @@ fn main() -> Result<()> {
     eprintln!("Parsing persistence artifacts...");
     tl::parsers::autorun_parser::parse_autoruns(&provider, &manifest, &mut store)?;
     tl::parsers::wmi_parser::parse_wmi_persistence(&provider, &manifest, &mut store)?;
+    tl::parsers::network_parser::parse_network_history(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     // Parse user activity artifacts
