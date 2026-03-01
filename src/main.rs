@@ -110,6 +110,7 @@ fn main() -> Result<()> {
     tl::parsers::userassist_parser::parse_userassist(&provider, &manifest, &mut store)?;
     tl::parsers::shellbag_parser::parse_shellbags(&provider, &manifest, &mut store)?;
     tl::parsers::recycle_bin_parser::parse_recycle_bin(&provider, &manifest, &mut store)?;
+    tl::parsers::mru_parser::parse_mru_lists(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     store.sort();
