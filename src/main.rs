@@ -29,6 +29,10 @@ struct Cli {
     /// Export timeline to JSON instead of opening TUI
     #[arg(long)]
     export_json: Option<std::path::PathBuf>,
+
+    /// Export timeline in bodyfile (mactime) format
+    #[arg(long)]
+    export_bodyfile: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -134,6 +138,13 @@ fn main() -> Result<()> {
         let mut writer = std::io::BufWriter::new(file);
         tl::export::json_export::export_json(&store, &mut writer)?;
         eprintln!("Exported {} entries to {}", store.len(), json_path.display());
+        return Ok(());
+    }
+    if let Some(ref bodyfile_path) = cli.export_bodyfile {
+        let file = std::fs::File::create(bodyfile_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        tl::export::bodyfile_export::export_bodyfile(&store, &mut writer)?;
+        eprintln!("Exported {} entries to {}", store.len(), bodyfile_path.display());
         return Ok(());
     }
 
