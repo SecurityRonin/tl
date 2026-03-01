@@ -41,6 +41,9 @@ regex = "1"
 anyhow = "1"
 thiserror = "1"
 
+# Registry parsing
+nt_hive2 = "4.2.4"
+
 # Logging
 log = "0.4"
 env_logger = "0.11"
