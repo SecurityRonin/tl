@@ -139,6 +139,7 @@ fn main() -> Result<()> {
     tl::parsers::posh_history_parser::parse_powershell_history(&provider, &manifest, &mut store)?;
     tl::parsers::browser_parser::parse_browser_history(&provider, &manifest, &mut store)?;
     tl::parsers::activities_parser::parse_activities_cache(&provider, &manifest, &mut store)?;
+    tl::parsers::rdp_cache_parser::parse_rdp_cache(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
     // Parse event logs

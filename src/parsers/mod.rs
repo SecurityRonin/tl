@@ -12,6 +12,7 @@ pub mod mru_parser;
 pub mod network_parser;
 pub mod posh_history_parser;
 pub mod prefetch_parser;
+pub mod rdp_cache_parser;
 pub mod recycle_bin_parser;
 pub mod schtask_parser;
 pub mod services_parser;
