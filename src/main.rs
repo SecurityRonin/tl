@@ -86,7 +86,14 @@ fn main() -> Result<()> {
         eprintln!("Warning: No $MFT found in collection");
     }
 
-    // Step 3b: Parse $UsnJrnl:$J into TimelineStore
+    // Step 3b: Parse $LogFile for gap detection
+    if manifest.logfile.is_some() {
+        eprintln!("Parsing $LogFile...");
+        tl::parsers::logfile_parser::parse_logfile_artifact(&provider, &manifest, &mut store)?;
+        eprintln!("  Timeline now has {} entries", store.len());
+    }
+
+    // Step 3c: Parse $UsnJrnl:$J into TimelineStore
     if let Some(ref usn_path) = manifest.usnjrnl_j {
         eprintln!("Parsing $UsnJrnl:$J...");
         let usn_data = provider

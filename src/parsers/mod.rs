@@ -4,6 +4,7 @@ pub mod bam_parser;
 pub mod evtx_parser;
 pub mod jumplist_parser;
 pub mod lnk_parser;
+pub mod logfile_parser;
 pub mod mft_parser;
 pub mod mru_parser;
 pub mod prefetch_parser;
