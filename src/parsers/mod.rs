@@ -15,5 +15,6 @@ pub mod shellbag_parser;
 pub mod srum_parser;
 pub mod shimcache_parser;
 pub mod userassist_parser;
+pub mod user_registry_parser;
 pub mod usn_parser;
 pub mod wmi_parser;
