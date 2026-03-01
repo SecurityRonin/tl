@@ -123,8 +123,11 @@ fn main() -> Result<()> {
         eprintln!("Exported {} entries to {}", store.len(), csv_path.display());
         return Ok(());
     }
-    if let Some(ref _json_path) = cli.export_json {
-        eprintln!("JSON export not yet implemented");
+    if let Some(ref json_path) = cli.export_json {
+        let file = std::fs::File::create(json_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        tl::export::json_export::export_json(&store, &mut writer)?;
+        eprintln!("Exported {} entries to {}", store.len(), json_path.display());
         return Ok(());
     }
 
