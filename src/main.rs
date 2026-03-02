@@ -37,6 +37,10 @@ struct Cli {
     /// Path to directory of Sigma rules (.yml/.yaml) for detection
     #[arg(long)]
     sigma_rules: Option<std::path::PathBuf>,
+
+    /// Auto-download SigmaHQ community rules and run detection (updates every 24h)
+    #[arg(long)]
+    sigma: bool,
 }
 
 #[cfg(test)]
@@ -54,6 +58,27 @@ mod tests {
     fn test_cli_sigma_rules_is_optional() {
         let cli = Cli::try_parse_from(["tl", "collection.zip"]).unwrap();
         assert!(cli.sigma_rules.is_none());
+    }
+
+    #[test]
+    fn test_cli_accepts_sigma_flag() {
+        let cli = Cli::try_parse_from(["tl", "collection.zip", "--sigma"]).unwrap();
+        assert!(cli.sigma);
+    }
+
+    #[test]
+    fn test_cli_sigma_default_false() {
+        let cli = Cli::try_parse_from(["tl", "collection.zip"]).unwrap();
+        assert!(!cli.sigma);
+    }
+
+    #[test]
+    fn test_cli_sigma_and_sigma_rules_coexist() {
+        let cli = Cli::try_parse_from([
+            "tl", "collection.zip", "--sigma", "--sigma-rules", "/extra-rules",
+        ]).unwrap();
+        assert!(cli.sigma);
+        assert_eq!(cli.sigma_rules, Some(std::path::PathBuf::from("/extra-rules")));
     }
 }
 
@@ -169,8 +194,9 @@ fn main() -> Result<()> {
     eprintln!("  Timeline now has {} entries", store.len());
 
     // Parse event logs (capture raw entries for Sigma detection if rules provided)
+    let wants_sigma = cli.sigma || cli.sigma_rules.is_some();
     eprintln!("Parsing event logs...");
-    let evtx_entries = if cli.sigma_rules.is_some() {
+    let evtx_entries = if wants_sigma {
         tl::parsers::evtx_parser::parse_event_logs_with_entries(&provider, &manifest, &mut store)?
     } else {
         tl::parsers::evtx_parser::parse_event_logs(&provider, &manifest, &mut store)?;
@@ -180,13 +206,25 @@ fn main() -> Result<()> {
     eprintln!("  Timeline now has {} entries", store.len());
 
     // Sigma rule detection
-    if let Some(ref rules_dir) = cli.sigma_rules {
-        eprintln!("Loading Sigma rules from {}...", rules_dir.display());
+    if wants_sigma {
         let mut engine = tl::detection::engine::DetectionEngine::new();
-        let count = engine.load_rules_from_dir(rules_dir)?;
-        eprintln!("  {} Sigma rules loaded", count);
 
-        if count > 0 {
+        // Auto-download SigmaHQ rules if --sigma flag used
+        if cli.sigma {
+            let cache_dir = tl::detection::rule_cache::default_cache_dir();
+            let rules_dir = tl::detection::rule_cache::ensure_rules(&cache_dir)?;
+            let count = engine.load_rules_from_dir(&rules_dir)?;
+            eprintln!("  {} SigmaHQ rules loaded", count);
+        }
+
+        // Load custom rules if --sigma-rules provided
+        if let Some(ref rules_dir) = cli.sigma_rules {
+            let count = engine.load_rules_from_dir(rules_dir)?;
+            eprintln!("  {} custom Sigma rules loaded from {}", count, rules_dir.display());
+        }
+
+        if engine.rule_count() > 0 {
+            eprintln!("[*] Evaluating {} rules against {} events...", engine.rule_count(), evtx_entries.len());
             let detections = engine.evaluate_batch(&evtx_entries);
             if detections.is_empty() {
                 eprintln!("  No Sigma detections");

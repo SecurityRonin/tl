@@ -38,26 +38,36 @@ impl DetectionEngine {
         self.rules.push(rule);
     }
 
-    /// Load all `.yml` / `.yaml` files from a directory (non-recursive).
+    /// Load all `.yml` / `.yaml` files from a directory (recursively).
     pub fn load_rules_from_dir(&mut self, dir: &Path) -> Result<usize> {
         let mut count = 0;
-        for pattern in &["*.yml", "*.yaml"] {
-            let full = format!("{}/{}", dir.display(), pattern);
-            for path in glob::glob(&full).unwrap_or_else(|_| glob::glob("").unwrap()) {
-                if let Ok(path) = path {
+        self.load_rules_recursive(dir, &mut count);
+        Ok(count)
+    }
+
+    fn load_rules_recursive(&mut self, dir: &Path, count: &mut usize) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                self.load_rules_recursive(&path, count);
+            } else if let Some(ext) = path.extension() {
+                if ext == "yml" || ext == "yaml" {
                     match SigmaRule::from_file(&path) {
                         Ok(rule) => {
                             self.rules.push(rule);
-                            count += 1;
+                            *count += 1;
                         }
                         Err(e) => {
-                            log::warn!("skipping {}: {}", path.display(), e);
+                            log::debug!("skipping {}: {}", path.display(), e);
                         }
                     }
                 }
             }
         }
-        Ok(count)
     }
 
     /// Returns the number of loaded rules.
