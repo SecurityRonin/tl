@@ -564,6 +564,83 @@ pub fn parse_event_logs(
     Ok(())
 }
 
+/// Parse all EVTX files and return raw EvtxEntry objects (for Sigma detection).
+/// Also populates the timeline store.
+pub fn parse_event_logs_with_entries(
+    provider: &dyn CollectionProvider,
+    manifest: &ArtifactManifest,
+    store: &mut TimelineStore,
+) -> Result<Vec<EvtxEntry>> {
+    let evtx_files = manifest.event_logs();
+    if evtx_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut all_entries = Vec::new();
+
+    for evtx_path in evtx_files {
+        let data = match provider.open_file(evtx_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Failed to read EVTX file {}: {}", evtx_path, e);
+                continue;
+            }
+        };
+
+        let mut parser = match evtx::EvtxParser::from_buffer(data) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Could not parse EVTX file {}: {}", evtx_path, e);
+                continue;
+            }
+        };
+
+        let settings = evtx::ParserSettings::default().num_threads(1);
+        parser = parser.with_configuration(settings);
+
+        for record in parser.records() {
+            let record = match record {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let parsed = match parse_evtx_record_xml(&record.data) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            let event_type = map_event_type(&parsed);
+
+            // Keep the raw entry for detection regardless of filter
+            all_entries.push(parsed.clone());
+
+            if matches!(event_type, EventType::Other(ref s) if s.starts_with("EID:")) {
+                continue;
+            }
+
+            let desc = build_description(&parsed);
+
+            let entry = TimelineEntry {
+                entity_id: EntityId::Generated(next_evtx_id()),
+                path: desc,
+                primary_timestamp: parsed.timestamp,
+                event_type,
+                timestamps: TimestampSet {
+                    evtx_timestamp: Some(parsed.timestamp),
+                    ..TimestampSet::default()
+                },
+                sources: smallvec![ArtifactSource::Evtx(parsed.channel.clone())],
+                anomalies: AnomalyFlags::empty(),
+                metadata: EntryMetadata::default(),
+            };
+
+            store.push(entry);
+        }
+    }
+
+    Ok(all_entries)
+}
+
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -33,6 +33,28 @@ struct Cli {
     /// Export timeline in bodyfile (mactime) format
     #[arg(long)]
     export_bodyfile: Option<std::path::PathBuf>,
+
+    /// Path to directory of Sigma rules (.yml/.yaml) for detection
+    #[arg(long)]
+    sigma_rules: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_accepts_sigma_rules_flag() {
+        let cli = Cli::try_parse_from(["tl", "collection.zip", "--sigma-rules", "/rules"]).unwrap();
+        assert_eq!(cli.sigma_rules, Some(std::path::PathBuf::from("/rules")));
+    }
+
+    #[test]
+    fn test_cli_sigma_rules_is_optional() {
+        let cli = Cli::try_parse_from(["tl", "collection.zip"]).unwrap();
+        assert!(cli.sigma_rules.is_none());
+    }
 }
 
 fn main() -> Result<()> {
@@ -146,11 +168,41 @@ fn main() -> Result<()> {
     tl::parsers::rdp_cache_parser::parse_rdp_cache(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
 
-    // Parse event logs
+    // Parse event logs (capture raw entries for Sigma detection if rules provided)
     eprintln!("Parsing event logs...");
-    tl::parsers::evtx_parser::parse_event_logs(&provider, &manifest, &mut store)?;
+    let evtx_entries = if cli.sigma_rules.is_some() {
+        tl::parsers::evtx_parser::parse_event_logs_with_entries(&provider, &manifest, &mut store)?
+    } else {
+        tl::parsers::evtx_parser::parse_event_logs(&provider, &manifest, &mut store)?;
+        Vec::new()
+    };
     tl::parsers::schtask_parser::parse_scheduled_tasks(&provider, &manifest, &mut store)?;
     eprintln!("  Timeline now has {} entries", store.len());
+
+    // Sigma rule detection
+    if let Some(ref rules_dir) = cli.sigma_rules {
+        eprintln!("Loading Sigma rules from {}...", rules_dir.display());
+        let mut engine = tl::detection::engine::DetectionEngine::new();
+        let count = engine.load_rules_from_dir(rules_dir)?;
+        eprintln!("  {} Sigma rules loaded", count);
+
+        if count > 0 {
+            let detections = engine.evaluate_batch(&evtx_entries);
+            if detections.is_empty() {
+                eprintln!("  No Sigma detections");
+            } else {
+                eprintln!("[!] {} Sigma detections:", detections.len());
+                for d in &detections {
+                    eprintln!(
+                        "    [{:?}] {} | EID:{} {} {}",
+                        d.level, d.rule_title, d.event.event_id,
+                        d.event.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        d.event.channel,
+                    );
+                }
+            }
+        }
+    }
 
     store.sort();
 
