@@ -295,9 +295,190 @@ mod tests {
     }
 
     #[test]
+    fn test_event_type_display_all_variants() {
+        assert_eq!(format!("{}", EventType::FileAccess), "ACC");
+        assert_eq!(format!("{}", EventType::FileDelete), "DEL");
+        assert_eq!(format!("{}", EventType::FileRename), "REN");
+        assert_eq!(format!("{}", EventType::Execute), "EXEC");
+        assert_eq!(format!("{}", EventType::RegistryModify), "REG");
+        assert_eq!(format!("{}", EventType::ServiceInstall), "SVC");
+        assert_eq!(format!("{}", EventType::ScheduledTaskCreate), "TASK");
+        assert_eq!(format!("{}", EventType::UserLogon), "LOGON");
+        assert_eq!(format!("{}", EventType::UserLogoff), "LOGOFF");
+        assert_eq!(format!("{}", EventType::ProcessCreate), "PROC");
+        assert_eq!(format!("{}", EventType::NetworkConnection), "NET");
+        assert_eq!(format!("{}", EventType::BitsTransfer), "BITS");
+        assert_eq!(format!("{}", EventType::RdpSession), "RDP");
+    }
+
+    #[test]
     fn test_artifact_source_display() {
         assert_eq!(format!("{}", ArtifactSource::Mft), "MFT");
         assert_eq!(format!("{}", ArtifactSource::Evtx("Security".to_string())), "EVT:Security");
         assert_eq!(format!("{}", ArtifactSource::Registry("SYSTEM".to_string())), "REG:SYSTEM");
+    }
+
+    #[test]
+    fn test_artifact_source_display_all_variants() {
+        assert_eq!(format!("{}", ArtifactSource::UsnJrnl), "USN");
+        assert_eq!(format!("{}", ArtifactSource::LogFile), "LOG");
+        assert_eq!(format!("{}", ArtifactSource::Prefetch), "PF");
+        assert_eq!(format!("{}", ArtifactSource::Amcache), "AM");
+        assert_eq!(format!("{}", ArtifactSource::Shimcache), "SHIM");
+        assert_eq!(format!("{}", ArtifactSource::BamDam), "BAM");
+        assert_eq!(format!("{}", ArtifactSource::UserAssist), "UA");
+        assert_eq!(format!("{}", ArtifactSource::Lnk), "LNK");
+        assert_eq!(format!("{}", ArtifactSource::JumpList), "JL");
+        assert_eq!(format!("{}", ArtifactSource::Shellbags), "SB");
+        assert_eq!(format!("{}", ArtifactSource::RecycleBin), "RB");
+        assert_eq!(format!("{}", ArtifactSource::ScheduledTask), "TSK");
+        assert_eq!(format!("{}", ArtifactSource::Srum), "SRUM");
+        assert_eq!(format!("{}", ArtifactSource::Wmi), "WMI");
+    }
+
+    // ─── AnomalyFlags ───────────────────────────────────────
+
+    #[test]
+    fn test_anomaly_flags_individual_values() {
+        assert_eq!(AnomalyFlags::TIMESTOMPED_SI_LT_FN.bits(), 0b0000_0001);
+        assert_eq!(AnomalyFlags::TIMESTOMPED_ZERO_NANOS.bits(), 0b0000_0010);
+        assert_eq!(AnomalyFlags::METADATA_BACKDATED.bits(), 0b0000_0100);
+        assert_eq!(AnomalyFlags::NO_USN_CREATE.bits(), 0b0000_1000);
+        assert_eq!(AnomalyFlags::LOG_GAP_DETECTED.bits(), 0b0001_0000);
+        assert_eq!(AnomalyFlags::LOG_CLEARED.bits(), 0b0010_0000);
+        assert_eq!(AnomalyFlags::EXECUTION_NO_PREFETCH.bits(), 0b0100_0000);
+        assert_eq!(AnomalyFlags::HIDDEN_ADS.bits(), 0b1000_0000);
+    }
+
+    #[test]
+    fn test_anomaly_flags_combination() {
+        let combined = AnomalyFlags::TIMESTOMPED_SI_LT_FN | AnomalyFlags::LOG_CLEARED;
+        assert!(combined.contains(AnomalyFlags::TIMESTOMPED_SI_LT_FN));
+        assert!(combined.contains(AnomalyFlags::LOG_CLEARED));
+        assert!(!combined.contains(AnomalyFlags::HIDDEN_ADS));
+    }
+
+    #[test]
+    fn test_anomaly_flags_empty() {
+        let empty = AnomalyFlags::empty();
+        assert!(empty.is_empty());
+        assert!(!empty.contains(AnomalyFlags::TIMESTOMPED_SI_LT_FN));
+    }
+
+    #[test]
+    fn test_anomaly_flags_serialize() {
+        let flags = AnomalyFlags::TIMESTOMPED_SI_LT_FN | AnomalyFlags::NO_USN_CREATE;
+        let json = serde_json::to_string(&flags).unwrap();
+        assert_eq!(json, format!("{}", flags.bits()));
+    }
+
+    // ─── EntityId ───────────────────────────────────────────
+
+    #[test]
+    fn test_entity_id_mft_entry() {
+        let id = EntityId::MftEntry(42);
+        assert_eq!(id, EntityId::MftEntry(42));
+        assert_ne!(id, EntityId::MftEntry(43));
+        assert_ne!(id, EntityId::Generated(42));
+    }
+
+    #[test]
+    fn test_entity_id_generated() {
+        let id = EntityId::Generated(99);
+        assert_eq!(id, EntityId::Generated(99));
+    }
+
+    #[test]
+    fn test_entity_id_debug() {
+        let id = EntityId::MftEntry(100);
+        let dbg = format!("{:?}", id);
+        assert!(dbg.contains("MftEntry"));
+        assert!(dbg.contains("100"));
+    }
+
+    // ─── TimestampSet default ───────────────────────────────
+
+    #[test]
+    fn test_timestamp_set_default_all_none() {
+        let ts = TimestampSet::default();
+        assert!(ts.si_created.is_none());
+        assert!(ts.si_modified.is_none());
+        assert!(ts.si_accessed.is_none());
+        assert!(ts.si_entry_modified.is_none());
+        assert!(ts.fn_created.is_none());
+        assert!(ts.fn_modified.is_none());
+        assert!(ts.fn_accessed.is_none());
+        assert!(ts.fn_entry_modified.is_none());
+        assert!(ts.usn_timestamp.is_none());
+        assert!(ts.lnk_target_created.is_none());
+        assert!(ts.lnk_target_modified.is_none());
+        assert!(ts.lnk_target_accessed.is_none());
+        assert!(ts.jumplist_timestamp.is_none());
+        assert!(ts.prefetch_last_run.is_empty());
+        assert!(ts.amcache_timestamp.is_none());
+        assert!(ts.shimcache_timestamp.is_none());
+        assert!(ts.evtx_timestamp.is_none());
+    }
+
+    // ─── EntryMetadata default ──────────────────────────────
+
+    #[test]
+    fn test_entry_metadata_default() {
+        let meta = EntryMetadata::default();
+        assert!(meta.file_size.is_none());
+        assert!(meta.mft_entry_number.is_none());
+        assert!(meta.mft_sequence.is_none());
+        assert!(!meta.is_directory);
+        assert!(!meta.has_ads);
+        assert!(meta.parent_path.is_none());
+        assert!(meta.sha256.is_none());
+        assert!(meta.sha1.is_none());
+    }
+
+    // ─── detect_anomalies: zero nanos ───────────────────────
+
+    #[test]
+    fn test_detect_timestomping_zero_nanos_created() {
+        let mut ts = TimestampSet::default();
+        // SI created has zero nanos (truncated by timestomping tool)
+        ts.si_created = Some(Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap());
+        // FN created has non-zero nanos
+        ts.fn_created = Some(
+            Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0)
+                .unwrap()
+                .checked_add_signed(chrono::Duration::nanoseconds(123456789))
+                .unwrap(),
+        );
+
+        let anomalies = detect_anomalies(&ts);
+        assert!(anomalies.contains(AnomalyFlags::TIMESTOMPED_ZERO_NANOS));
+    }
+
+    #[test]
+    fn test_detect_timestomping_zero_nanos_modified() {
+        let mut ts = TimestampSet::default();
+        // SI modified has zero nanos
+        ts.si_modified = Some(Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap());
+        // FN modified has non-zero nanos
+        ts.fn_modified = Some(
+            Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0)
+                .unwrap()
+                .checked_add_signed(chrono::Duration::nanoseconds(500000000))
+                .unwrap(),
+        );
+
+        let anomalies = detect_anomalies(&ts);
+        assert!(anomalies.contains(AnomalyFlags::TIMESTOMPED_ZERO_NANOS));
+    }
+
+    #[test]
+    fn test_no_zero_nanos_anomaly_when_both_have_nanos() {
+        let mut ts = TimestampSet::default();
+        let base = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        ts.si_created = Some(base.checked_add_signed(chrono::Duration::nanoseconds(100)).unwrap());
+        ts.fn_created = Some(base.checked_add_signed(chrono::Duration::nanoseconds(200)).unwrap());
+
+        let anomalies = detect_anomalies(&ts);
+        assert!(!anomalies.contains(AnomalyFlags::TIMESTOMPED_ZERO_NANOS));
     }
 }

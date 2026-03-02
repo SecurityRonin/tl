@@ -305,6 +305,276 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ─── next_netlist_id tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_next_netlist_id_increments() {
+        let id1 = next_netlist_id();
+        let id2 = next_netlist_id();
+        assert!(id2 > id1);
+        assert_eq!(id2 - id1, 1);
+    }
+
+    #[test]
+    fn test_next_netlist_id_has_nl_prefix() {
+        let id = next_netlist_id();
+        let prefix = (id >> 48) & 0xFFFF;
+        assert_eq!(prefix, 0x4E4C);
+    }
+
+    // ─── parse_systemtime edge cases ────────────────────────────────────
+
+    #[test]
+    fn test_parse_systemtime_exactly_16_bytes() {
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2024u16.to_le_bytes());
+        data[2..4].copy_from_slice(&12u16.to_le_bytes());
+        data[6..8].copy_from_slice(&25u16.to_le_bytes());
+        data[8..10].copy_from_slice(&23u16.to_le_bytes());
+        data[10..12].copy_from_slice(&59u16.to_le_bytes());
+        data[12..14].copy_from_slice(&59u16.to_le_bytes());
+        let dt = parse_systemtime(&data).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-12-25 23:59:59");
+    }
+
+    #[test]
+    fn test_parse_systemtime_midnight() {
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&1u16.to_le_bytes());
+        // hour=0, min=0, sec=0 (already zero)
+        let dt = parse_systemtime(&data).unwrap();
+        assert_eq!(dt.format("%H:%M:%S").to_string(), "00:00:00");
+    }
+
+    #[test]
+    fn test_parse_systemtime_zero_year() {
+        let mut data = [0u8; 16];
+        data[2..4].copy_from_slice(&6u16.to_le_bytes()); // month
+        data[6..8].copy_from_slice(&15u16.to_le_bytes()); // day
+        // year=0 should return None
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_zero_month() {
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes()); // year
+        data[6..8].copy_from_slice(&15u16.to_le_bytes()); // day
+        // month=0 should return None
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_zero_day() {
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes()); // year
+        data[2..4].copy_from_slice(&6u16.to_le_bytes()); // month
+        // day=0 should return None
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_15_bytes() {
+        // Exactly 15 bytes should return None (needs 16)
+        assert!(parse_systemtime(&[1u8; 15]).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_empty() {
+        assert!(parse_systemtime(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_longer_than_16() {
+        // Extra bytes should be ignored
+        let mut data = [0u8; 32];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&3u16.to_le_bytes());
+        data[6..8].copy_from_slice(&10u16.to_le_bytes());
+        data[8..10].copy_from_slice(&12u16.to_le_bytes());
+        data[10..12].copy_from_slice(&30u16.to_le_bytes());
+        data[12..14].copy_from_slice(&45u16.to_le_bytes());
+        let dt = parse_systemtime(&data).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-03-10 12:30:45");
+    }
+
+    // ─── network_type_str comprehensive tests ───────────────────────────
+
+    #[test]
+    fn test_network_type_str_all_known() {
+        assert_eq!(network_type_str(6), "Wired");
+        assert_eq!(network_type_str(23), "VPN");
+        assert_eq!(network_type_str(71), "Wireless");
+    }
+
+    #[test]
+    fn test_network_type_str_unknown_values() {
+        assert_eq!(network_type_str(0), "Unknown");
+        assert_eq!(network_type_str(1), "Unknown");
+        assert_eq!(network_type_str(5), "Unknown");
+        assert_eq!(network_type_str(7), "Unknown");
+        assert_eq!(network_type_str(22), "Unknown");
+        assert_eq!(network_type_str(24), "Unknown");
+        assert_eq!(network_type_str(70), "Unknown");
+        assert_eq!(network_type_str(72), "Unknown");
+        assert_eq!(network_type_str(255), "Unknown");
+        assert_eq!(network_type_str(u32::MAX), "Unknown");
+    }
+
+    // ─── NetworkProfileEntry tests ──────────────────────────────────────
+
+    #[test]
+    fn test_network_profile_entry_clone() {
+        let now = Utc::now();
+        let entry = NetworkProfileEntry {
+            profile_name: "TestNet".to_string(),
+            description: "Desc".to_string(),
+            dns_suffix: "test.local".to_string(),
+            first_connected: Some(now),
+            last_connected: Some(now),
+            network_type: 71,
+            managed: false,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.profile_name, entry.profile_name);
+        assert_eq!(cloned.dns_suffix, entry.dns_suffix);
+        assert_eq!(cloned.network_type, entry.network_type);
+        assert_eq!(cloned.managed, entry.managed);
+    }
+
+    #[test]
+    fn test_network_profile_entry_debug() {
+        let entry = NetworkProfileEntry {
+            profile_name: "DebugNet".to_string(),
+            description: String::new(),
+            dns_suffix: String::new(),
+            first_connected: None,
+            last_connected: None,
+            network_type: 0,
+            managed: false,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("NetworkProfileEntry"));
+        assert!(debug_str.contains("DebugNet"));
+    }
+
+    #[test]
+    fn test_network_profile_entry_no_timestamps() {
+        let entry = NetworkProfileEntry {
+            profile_name: "NoTime".to_string(),
+            description: String::new(),
+            dns_suffix: String::new(),
+            first_connected: None,
+            last_connected: None,
+            network_type: 6,
+            managed: false,
+        };
+        assert!(entry.first_connected.is_none());
+        assert!(entry.last_connected.is_none());
+    }
+
+    #[test]
+    fn test_network_profile_entry_managed_flag() {
+        let entry = NetworkProfileEntry {
+            profile_name: "ManagedNet".to_string(),
+            description: String::new(),
+            dns_suffix: "corp.com".to_string(),
+            first_connected: None,
+            last_connected: None,
+            network_type: 71,
+            managed: true,
+        };
+        assert!(entry.managed);
+    }
+
+    // ─── Description formatting tests ───────────────────────────────────
+
+    #[test]
+    fn test_network_first_connect_description() {
+        let profile = NetworkProfileEntry {
+            profile_name: "CoffeeShop WiFi".to_string(),
+            description: String::new(),
+            dns_suffix: "local".to_string(),
+            first_connected: Some(Utc::now()),
+            last_connected: None,
+            network_type: 71,
+            managed: false,
+        };
+        let desc = format!(
+            "[NetProfile:FirstConnect] {} ({}, DNS: {})",
+            profile.profile_name,
+            network_type_str(profile.network_type),
+            profile.dns_suffix
+        );
+        assert!(desc.contains("CoffeeShop WiFi"));
+        assert!(desc.contains("Wireless"));
+        assert!(desc.contains("DNS: local"));
+    }
+
+    #[test]
+    fn test_network_last_connect_description() {
+        let profile = NetworkProfileEntry {
+            profile_name: "CorpVPN".to_string(),
+            description: String::new(),
+            dns_suffix: "corp.internal".to_string(),
+            first_connected: None,
+            last_connected: Some(Utc::now()),
+            network_type: 23,
+            managed: true,
+        };
+        let desc = format!(
+            "[NetProfile:LastConnect] {} ({}, DNS: {})",
+            profile.profile_name,
+            network_type_str(profile.network_type),
+            profile.dns_suffix
+        );
+        assert!(desc.contains("CorpVPN"));
+        assert!(desc.contains("VPN"));
+        assert!(desc.contains("corp.internal"));
+    }
+
+    #[test]
+    fn test_network_wired_description() {
+        let desc = format!(
+            "[NetProfile:FirstConnect] {} ({}, DNS: {})",
+            "Office LAN",
+            network_type_str(6),
+            "office.local"
+        );
+        assert!(desc.contains("Wired"));
+    }
+
+    // ─── Registry key path constant tests ───────────────────────────────
+
+    #[test]
+    fn test_network_profiles_key_format() {
+        assert!(NETWORK_PROFILES_KEY.contains("NetworkList"));
+        assert!(NETWORK_PROFILES_KEY.contains("Profiles"));
+    }
+
+    #[test]
+    fn test_network_signatures_key_format() {
+        assert!(NETWORK_SIGNATURES_KEY.contains("NetworkList"));
+        assert!(NETWORK_SIGNATURES_KEY.contains("Signatures"));
+    }
+
+    // ─── parse_network_profiles edge cases ──────────────────────────────
+
+    #[test]
+    fn test_parse_network_profiles_empty_data() {
+        let result = parse_network_profiles(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_network_profiles_garbage_data() {
+        let garbage = vec![0xFFu8; 512];
+        let result = parse_network_profiles(&garbage);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_empty_manifest_no_error() {
         let manifest = ArtifactManifest::default();

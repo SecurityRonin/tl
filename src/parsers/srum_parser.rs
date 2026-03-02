@@ -829,6 +829,281 @@ mod tests {
             parse_srum_from_ese("/also/nonexistent");
     }
 
+    // ─── next_srum_id tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_next_srum_id_increments() {
+        let id1 = next_srum_id();
+        let id2 = next_srum_id();
+        assert!(id2 > id1);
+        assert_eq!(id2 - id1, 1);
+    }
+
+    #[test]
+    fn test_next_srum_id_has_sr_prefix() {
+        let id = next_srum_id();
+        // Top 2 bytes should be 0x5352 ("SR")
+        let prefix = (id >> 48) & 0xFFFF;
+        assert_eq!(prefix, 0x5352);
+    }
+
+    // ─── col() helper tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_col_case_insensitive() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("appid".to_string(), 0);
+        map.insert("timestamp".to_string(), 1);
+        assert_eq!(col(&map, "AppId"), Some(0));
+        assert_eq!(col(&map, "APPID"), Some(0));
+        assert_eq!(col(&map, "Timestamp"), Some(1));
+    }
+
+    #[test]
+    fn test_col_missing_key() {
+        let map = std::collections::HashMap::new();
+        assert_eq!(col(&map, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_col_empty_map() {
+        let map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        assert_eq!(col(&map, "anything"), None);
+    }
+
+    // ─── filetime_to_datetime edge cases ────────────────────────────────
+
+    #[test]
+    fn test_filetime_very_small_value() {
+        // A FILETIME value smaller than the epoch diff should return None
+        // (checked_sub would fail)
+        let ft: u64 = 100; // tiny value, way before Unix epoch
+        assert!(filetime_to_datetime(ft).is_none());
+    }
+
+    #[test]
+    fn test_filetime_preserves_subseconds() {
+        // Test that nanosecond portion is correctly computed
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        // Add 5_000_000 100ns intervals = 0.5 seconds
+        let ft = secs as u64 * 10_000_000 + 5_000_000;
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result.timestamp_subsec_nanos(), 500_000_000);
+    }
+
+    #[test]
+    fn test_filetime_at_unix_epoch() {
+        // FILETIME for 1970-01-01 00:00:00 UTC
+        let ft: u64 = 11_644_473_600 * 10_000_000;
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result.timestamp(), 0);
+    }
+
+    // ─── resolve_id edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_id_from_u32_with_map() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(7, "svchost.exe".to_string());
+        let val = libesedb::Value::U32(7);
+        assert_eq!(resolve_id(&val, &map), "svchost.exe");
+    }
+
+    #[test]
+    fn test_resolve_id_from_u32_without_map() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::U32(123);
+        assert_eq!(resolve_id(&val, &map), "ID:123");
+    }
+
+    #[test]
+    fn test_resolve_id_empty_text() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Text(String::new());
+        assert_eq!(resolve_id(&val, &map), "");
+    }
+
+    // ─── format_bytes edge cases ────────────────────────────────────────
+
+    #[test]
+    fn test_format_bytes_one_byte() {
+        assert_eq!(format_bytes(1), "1 B");
+    }
+
+    #[test]
+    fn test_format_bytes_just_under_kb() {
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn test_format_bytes_just_under_mb() {
+        // 1023 KB = 1047552 bytes
+        let result = format_bytes(1047552);
+        assert!(result.contains("KB"), "expected KB, got: {}", result);
+    }
+
+    #[test]
+    fn test_format_bytes_exact_mb() {
+        assert_eq!(format_bytes(1048576), "1.0 MB");
+    }
+
+    #[test]
+    fn test_format_bytes_just_under_gb() {
+        // 1023 MB = 1072693248 bytes
+        let result = format_bytes(1072693248);
+        assert!(result.contains("MB"), "expected MB, got: {}", result);
+    }
+
+    #[test]
+    fn test_format_bytes_large_gb() {
+        // 10 GB
+        assert_eq!(format_bytes(10_737_418_240), "10.0 GB");
+    }
+
+    // ─── SRUM table GUID constant tests ─────────────────────────────────
+
+    #[test]
+    fn test_srum_table_guids_are_valid() {
+        assert!(APP_RESOURCE_USAGE_TABLE.starts_with('{'));
+        assert!(APP_RESOURCE_USAGE_TABLE.ends_with('}'));
+        assert!(NETWORK_DATA_USAGE_TABLE.starts_with('{'));
+        assert!(NETWORK_DATA_USAGE_TABLE.ends_with('}'));
+        assert!(NETWORK_CONNECTIVITY_TABLE.starts_with('{'));
+        assert!(NETWORK_CONNECTIVITY_TABLE.ends_with('}'));
+    }
+
+    #[test]
+    fn test_srum_table_guids_are_distinct() {
+        assert_ne!(APP_RESOURCE_USAGE_TABLE, NETWORK_DATA_USAGE_TABLE);
+        assert_ne!(APP_RESOURCE_USAGE_TABLE, NETWORK_CONNECTIVITY_TABLE);
+        assert_ne!(NETWORK_DATA_USAGE_TABLE, NETWORK_CONNECTIVITY_TABLE);
+    }
+
+    // ─── Struct Clone/Debug tests ───────────────────────────────────────
+
+    #[test]
+    fn test_srum_app_entry_clone() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = SrumAppEntry {
+            app_id: "test.exe".to_string(),
+            user_sid: "S-1-5-21-1234".to_string(),
+            timestamp: ts,
+            foreground_cycle_time: 100,
+            background_cycle_time: 200,
+            face_time: 300,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.app_id, entry.app_id);
+        assert_eq!(cloned.foreground_cycle_time, entry.foreground_cycle_time);
+    }
+
+    #[test]
+    fn test_srum_network_entry_clone() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let entry = SrumNetworkEntry {
+            app_id: "app.exe".to_string(),
+            user_sid: "S-1-5-21-5678".to_string(),
+            timestamp: ts,
+            bytes_sent: 999,
+            bytes_received: 1111,
+            interface_luid: 42,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.bytes_sent, 999);
+        assert_eq!(cloned.interface_luid, 42);
+    }
+
+    #[test]
+    fn test_srum_connectivity_entry_clone() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 8, 0, 0).unwrap();
+        let entry = SrumConnectivityEntry {
+            app_id: "svc.exe".to_string(),
+            user_sid: "S-1-5-18".to_string(),
+            timestamp: ts,
+            connected_time: 999,
+            interface_luid: 42,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.connected_time, 999);
+    }
+
+    #[test]
+    fn test_srum_app_entry_debug() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = SrumAppEntry {
+            app_id: "test.exe".to_string(),
+            user_sid: "S-1-5-21-1234".to_string(),
+            timestamp: ts,
+            foreground_cycle_time: 100,
+            background_cycle_time: 200,
+            face_time: 300,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("SrumAppEntry"));
+        assert!(debug_str.contains("test.exe"));
+    }
+
+    // ─── Description formatting tests ───────────────────────────────────
+
+    #[test]
+    fn test_srum_app_desc_format_zero_values() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let srum = SrumAppEntry {
+            app_id: "idle.exe".to_string(),
+            user_sid: "S-1-5-21-0".to_string(),
+            timestamp: ts,
+            foreground_cycle_time: 0,
+            background_cycle_time: 0,
+            face_time: 0,
+        };
+        let desc = format!(
+            "[SRUM:App] {} user:{} fg:{} bg:{} face:{}",
+            srum.app_id, srum.user_sid,
+            srum.foreground_cycle_time, srum.background_cycle_time, srum.face_time,
+        );
+        assert!(desc.contains("fg:0"));
+        assert!(desc.contains("bg:0"));
+        assert!(desc.contains("face:0"));
+    }
+
+    #[test]
+    fn test_srum_conn_desc_format() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let conn = SrumConnectivityEntry {
+            app_id: "net.exe".to_string(),
+            user_sid: "S-1-5-21-999".to_string(),
+            timestamp: ts,
+            connected_time: 0,
+            interface_luid: 0,
+        };
+        let desc = format!(
+            "[SRUM:Conn] {} user:{} connected:{}s",
+            conn.app_id, conn.user_sid, conn.connected_time,
+        );
+        assert!(desc.contains("connected:0s"));
+    }
+
+    #[test]
+    fn test_srum_net_desc_with_zero_bytes() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let net = SrumNetworkEntry {
+            app_id: "quiet.exe".to_string(),
+            user_sid: "S-1-5-18".to_string(),
+            timestamp: ts,
+            bytes_sent: 0,
+            bytes_received: 0,
+            interface_luid: 0,
+        };
+        let desc = format!(
+            "[SRUM:Net] {} user:{} sent:{} recv:{}",
+            net.app_id, net.user_sid,
+            format_bytes(net.bytes_sent), format_bytes(net.bytes_received),
+        );
+        assert!(desc.contains("sent:0 B"));
+        assert!(desc.contains("recv:0 B"));
+    }
+
     #[test]
     fn test_empty_manifest_no_error() {
         use crate::collection::manifest::ArtifactManifest;

@@ -1414,4 +1414,383 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_local_name_with_namespace() {
+        assert_eq!(local_name(b"ns:EventID"), "EventID");
+    }
+
+    #[test]
+    fn test_local_name_without_namespace() {
+        assert_eq!(local_name(b"EventID"), "EventID");
+    }
+
+    #[test]
+    fn test_local_name_empty() {
+        assert_eq!(local_name(b""), "");
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_rfc3339() {
+        let ts = parse_evtx_timestamp("2025-06-15T10:30:00Z").unwrap();
+        assert_eq!(ts.format("%Y-%m-%d").to_string(), "2025-06-15");
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_7digit_frac() {
+        let ts = parse_evtx_timestamp("2025-06-15T10:30:00.1234567Z").unwrap();
+        assert_eq!(ts.format("%Y-%m-%d").to_string(), "2025-06-15");
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_6digit_frac() {
+        let ts = parse_evtx_timestamp("2025-06-15T10:30:00.123456Z").unwrap();
+        assert!(ts.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_invalid() {
+        assert!(parse_evtx_timestamp("not-a-timestamp").is_none());
+        assert!(parse_evtx_timestamp("").is_none());
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_no_frac() {
+        let ts = parse_evtx_timestamp("2025-01-01T00:00:00Z").unwrap();
+        assert_eq!(ts.timestamp_subsec_nanos(), 0);
+    }
+
+    #[test]
+    fn test_is_sysmon_true() {
+        let e = make_entry(1, "Microsoft-Windows-Sysmon", "Sysmon/Operational", vec![]);
+        assert!(is_sysmon(&e));
+    }
+
+    #[test]
+    fn test_is_sysmon_false() {
+        let e = make_entry(4624, "Microsoft-Windows-Security-Auditing", "Security", vec![]);
+        assert!(!is_sysmon(&e));
+    }
+
+    #[test]
+    fn test_map_4625_to_user_logon() {
+        let e = make_entry(4625, "Security-Auditing", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::UserLogon);
+    }
+
+    #[test]
+    fn test_map_4647_to_user_logoff() {
+        let e = make_entry(4647, "Security-Auditing", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::UserLogoff);
+    }
+
+    #[test]
+    fn test_map_4698_to_scheduled_task_create() {
+        let e = make_entry(4698, "Security-Auditing", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::ScheduledTaskCreate);
+    }
+
+    #[test]
+    fn test_map_4702_to_scheduled_task_create() {
+        let e = make_entry(4702, "Security-Auditing", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::ScheduledTaskCreate);
+    }
+
+    #[test]
+    fn test_map_1102_log_cleared_not_rdp() {
+        let e = make_entry(1102, "Eventlog", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::Other("LogCleared".to_string()));
+    }
+
+    #[test]
+    fn test_map_1102_rdp_client_not_log_cleared() {
+        // EID 1102 on RDPClient channel should be RdpSession, not LogCleared
+        let e = make_entry(1102, "TerminalServices-RDPClient",
+            "Microsoft-Windows-TerminalServices-RDPClient/Operational", vec![]);
+        assert_eq!(map_event_type(&e), EventType::RdpSession);
+    }
+
+    #[test]
+    fn test_map_104_system_log_cleared() {
+        let e = make_entry(104, "Eventlog", "System", vec![]);
+        assert_eq!(map_event_type(&e), EventType::Other("LogCleared".to_string()));
+    }
+
+    #[test]
+    fn test_map_60_bits_transfer() {
+        let e = make_entry(60, "BITS", "BITS/Operational", vec![]);
+        assert_eq!(map_event_type(&e), EventType::BitsTransfer);
+    }
+
+    #[test]
+    fn test_map_61_bits_transfer() {
+        let e = make_entry(61, "BITS", "BITS/Operational", vec![]);
+        assert_eq!(map_event_type(&e), EventType::BitsTransfer);
+    }
+
+    #[test]
+    fn test_map_5157_to_network_connection() {
+        let e = make_entry(5157, "Security-Auditing", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::NetworkConnection);
+    }
+
+    #[test]
+    fn test_map_5145_to_share_access() {
+        let e = make_entry(5145, "Security-Auditing", "Security", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s == "ShareAccess"));
+    }
+
+    #[test]
+    fn test_map_1117_to_defender() {
+        let e = make_entry(1117, "Windows Defender", "Windows Defender/Operational", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s == "Defender"));
+    }
+
+    #[test]
+    fn test_map_unknown_eid() {
+        let e = make_entry(99999, "Unknown", "Unknown", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s.starts_with("EID:")));
+    }
+
+    #[test]
+    fn test_map_sysmon_unknown_eid() {
+        let e = make_entry(255, "Microsoft-Windows-Sysmon", "Sysmon/Operational", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(ref s) if s.starts_with("Sysmon:")));
+    }
+
+    #[test]
+    fn test_map_sysmon_12_to_registry_modify() {
+        let e = make_entry(12, "Microsoft-Windows-Sysmon", "Sysmon/Operational", vec![]);
+        assert_eq!(map_event_type(&e), EventType::RegistryModify);
+    }
+
+    #[test]
+    fn test_map_sysmon_14_to_registry_modify() {
+        let e = make_entry(14, "Microsoft-Windows-Sysmon", "Sysmon/Operational", vec![]);
+        assert_eq!(map_event_type(&e), EventType::RegistryModify);
+    }
+
+    #[test]
+    fn test_map_rdp_session_ids() {
+        for eid in [22, 23, 24, 25] {
+            let e = make_entry(eid, "Microsoft-Windows-TerminalServices-LocalSessionManager",
+                "TerminalServices", vec![]);
+            assert_eq!(map_event_type(&e), EventType::RdpSession, "EID {} should be RdpSession", eid);
+        }
+    }
+
+    #[test]
+    fn test_map_wmi_activity_range() {
+        for eid in [5857, 5858, 5859, 5860] {
+            let e = make_entry(eid, "WMI-Activity", "WMI-Activity/Operational", vec![]);
+            let et = map_event_type(&e);
+            assert!(matches!(et, EventType::Other(ref s) if s == "WmiActivity"),
+                "EID {} should be WmiActivity, got {:?}", eid, et);
+        }
+    }
+
+    #[test]
+    fn test_build_description_logoff() {
+        let e = make_entry(4634, "Security", "Security",
+            vec![("TargetUserName", "admin")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Logoff]"));
+        assert!(desc.contains("admin"));
+    }
+
+    #[test]
+    fn test_build_description_4647_logoff() {
+        let e = make_entry(4647, "Security", "Security",
+            vec![("TargetUserName", "user1")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Logoff]"));
+    }
+
+    #[test]
+    fn test_build_description_process_no_cmdline() {
+        let e = make_entry(4688, "Security", "Security",
+            vec![("NewProcessName", r"C:\calc.exe"), ("SubjectUserName", "admin")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Process]"));
+        assert!(desc.contains("calc.exe"));
+        assert!(!desc.contains("->"));
+    }
+
+    #[test]
+    fn test_build_description_4625_failed_logon() {
+        let e = make_entry(4625, "Security", "Security",
+            vec![("TargetUserName", "baduser"), ("TargetDomainName", "CORP"),
+                 ("LogonType", "3"), ("IpAddress", "10.0.0.1")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[FailedLogon]"));
+        assert!(desc.contains("baduser"));
+    }
+
+    #[test]
+    fn test_build_description_log_cleared_104() {
+        let e = make_entry(104, "Eventlog", "System", vec![]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[LogCleared]"));
+        assert!(desc.contains("System"));
+    }
+
+    #[test]
+    fn test_build_description_rdp_session() {
+        let e = make_entry(21, "Microsoft-Windows-TerminalServices-LocalSessionManager",
+            "TerminalServices",
+            vec![("User", r"CORP\admin"), ("Address", "192.168.1.100")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[RDP]"));
+        assert!(desc.contains("admin"));
+        assert!(desc.contains("192.168.1.100"));
+    }
+
+    #[test]
+    fn test_build_description_powershell_long_script() {
+        let long_script = "A".repeat(300);
+        let e = make_entry(4104, "PowerShell", "PowerShell/Operational",
+            vec![("ScriptBlockText", &long_script)]);
+        let desc = build_description(&e);
+        assert!(desc.contains("..."));
+        assert!(desc.len() < 300);
+    }
+
+    #[test]
+    fn test_build_description_powershell_no_path() {
+        let e = make_entry(4104, "PowerShell", "PowerShell/Operational",
+            vec![("ScriptBlockText", "Get-Process")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[PowerShell]"));
+        assert!(!desc.contains("->"));
+    }
+
+    #[test]
+    fn test_build_description_firewall_blocked() {
+        let e = make_entry(5157, "Security", "Security",
+            vec![("Application", "evil.exe"),
+                 ("SourceAddress", "10.0.0.1"), ("SourcePort", "1234"),
+                 ("DestAddress", "10.0.0.2"), ("DestPort", "80")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Net:Blocked]"));
+    }
+
+    #[test]
+    fn test_build_description_group_member_add() {
+        let e = make_entry(4732, "Security", "Security",
+            vec![("MemberSid", "S-1-5-123"), ("TargetUserName", "Admins"),
+                 ("SubjectUserName", "hacker")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[GroupMemberAdd]"));
+        assert!(desc.contains("hacker"));
+    }
+
+    #[test]
+    fn test_build_description_task_started_200() {
+        let e = make_entry(200, "TaskScheduler", "TaskScheduler/Operational",
+            vec![("TaskName", r"\MyTask"), ("ActionName", "cmd.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[TaskStarted]"));
+        assert!(desc.contains("cmd.exe"));
+    }
+
+    #[test]
+    fn test_build_description_wmi_with_possible_cause() {
+        let e = make_entry(5858, "WMI-Activity", "WMI-Activity/Operational",
+            vec![("PossibleCause", "Provider load failure")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[WMI:5858]"));
+        assert!(desc.contains("Provider load failure"));
+    }
+
+    #[test]
+    fn test_build_description_defender_action_alt_keys() {
+        let e = make_entry(1117, "Defender", "Defender/Operational",
+            vec![("Threat Name", "Malware.Gen"), ("Action Name", "Remove")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Defender:Action]"));
+        assert!(desc.contains("Malware.Gen"));
+        assert!(desc.contains("Remove"));
+    }
+
+    #[test]
+    fn test_build_description_share_access_5145() {
+        let e = make_entry(5145, "Security", "Security",
+            vec![("ShareName", r"\\*\IPC$"), ("RelativeTargetName", "srvsvc"),
+                 ("SubjectUserName", "admin"), ("IpAddress", "10.0.0.5")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Share]"));
+        assert!(desc.contains("IPC$"));
+    }
+
+    #[test]
+    fn test_build_description_unknown_event() {
+        let e = make_entry(77777, "SomeProvider", "SomeChannel", vec![]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[EVT:SomeChannel]"));
+        assert!(desc.contains("EID:77777"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_process_no_cmdline() {
+        let e = make_entry(1, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\calc.exe"), ("User", "admin"),
+                 ("ParentImage", r"C:\explorer.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:Process]"));
+        assert!(!desc.contains("->"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_registry_no_details() {
+        let e = make_entry(12, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\reg.exe"),
+                 ("TargetObject", r"HKLM\Test")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:Registry]"));
+        assert!(!desc.contains("="));
+    }
+
+    #[test]
+    fn test_build_description_rdp_client_1102() {
+        // EID 1102 on RDPClient channel
+        let e = make_entry(1102, "TerminalServices-RDPClient",
+            "Microsoft-Windows-TerminalServices-RDPClient/Operational",
+            vec![("Value", "remote-server.corp.local")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[RDPClient]"));
+        assert!(desc.contains("remote-server"));
+    }
+
+    #[test]
+    fn test_build_description_defender_detection_alt_key() {
+        let e = make_entry(1116, "Defender", "Defender/Operational",
+            vec![("Threat Name", "Trojan.Gen"), ("Path", r"C:\bad.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Defender:Detection]"));
+        assert!(desc.contains("Trojan.Gen"));
+    }
+
+    #[test]
+    fn test_next_evtx_id_increments() {
+        let id1 = next_evtx_id();
+        let id2 = next_evtx_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x4558);
+    }
+
+    #[test]
+    fn test_evtx_entry_clone_debug() {
+        let e = make_entry(4624, "Security", "Security",
+            vec![("TargetUserName", "admin")]);
+        let cloned = e.clone();
+        assert_eq!(cloned.event_id, 4624);
+        let debug_str = format!("{:?}", e);
+        assert!(debug_str.contains("4624"));
+    }
 }

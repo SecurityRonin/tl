@@ -560,4 +560,337 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_filetime_negative_secs() {
+        let filetime = 1u64;
+        assert!(filetime_to_datetime(filetime).is_none());
+    }
+
+    #[test]
+    fn test_filetime_with_subsecond() {
+        use chrono::TimeZone;
+        let dt_base = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let secs = dt_base.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000 + 7_500_000; // +0.75s
+        let result = filetime_to_datetime(filetime).unwrap();
+        assert_eq!(result.timestamp_subsec_nanos(), 750_000_000);
+    }
+
+    #[test]
+    fn test_read_u32_le_valid() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+        assert_eq!(read_u32_le(&data, 0), Some(0x12345678));
+    }
+
+    #[test]
+    fn test_read_u32_le_out_of_bounds() {
+        let data = [0x01, 0x02, 0x03];
+        assert!(read_u32_le(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_u32_le_offset() {
+        let data = [0xFF, 0xFF, 0x78, 0x56, 0x34, 0x12];
+        assert_eq!(read_u32_le(&data, 2), Some(0x12345678));
+    }
+
+    #[test]
+    fn test_read_u32_le_offset_out_of_bounds() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(read_u32_le(&data, 3).is_none()); // only 2 bytes left at offset 3
+    }
+
+    #[test]
+    fn test_read_u64_le_valid() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        assert_eq!(read_u64_le(&data, 0), Some(0x0807060504030201));
+    }
+
+    #[test]
+    fn test_read_u64_le_out_of_bounds() {
+        let data = [0u8; 7];
+        assert!(read_u64_le(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_u64_le_offset_out_of_bounds() {
+        let data = [0u8; 10];
+        assert!(read_u64_le(&data, 5).is_none()); // only 5 bytes left
+    }
+
+    #[test]
+    fn test_read_u16_le_valid() {
+        let data = [0x34, 0x12];
+        assert_eq!(read_u16_le(&data, 0), Some(0x1234));
+    }
+
+    #[test]
+    fn test_read_u16_le_out_of_bounds() {
+        let data = [0x01];
+        assert!(read_u16_le(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_u16_le_offset() {
+        let data = [0xFF, 0x34, 0x12];
+        assert_eq!(read_u16_le(&data, 1), Some(0x1234));
+    }
+
+    #[test]
+    fn test_read_ascii_string_basic() {
+        let data = b"hello\x00world";
+        let result = read_ascii_string(data, 0, 20);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_read_ascii_string_no_null() {
+        let data = b"hello world";
+        let result = read_ascii_string(data, 0, data.len());
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_read_ascii_string_with_offset() {
+        let data = b"XXXhello\x00";
+        let result = read_ascii_string(data, 3, 20);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_read_ascii_string_max_len_limits() {
+        let data = b"hello world this is a long string\x00";
+        let result = read_ascii_string(data, 0, 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_read_ascii_string_empty() {
+        let data = b"\x00rest";
+        let result = read_ascii_string(data, 0, 10);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_app_id_uppercase_hex() {
+        let filename = "5F7B5F1E01B83767.automaticDestinations-ms";
+        let app_id = extract_app_id(filename);
+        assert_eq!(app_id, Some("5f7b5f1e01b83767".to_string()));
+    }
+
+    #[test]
+    fn test_extract_app_id_mixed_case() {
+        let filename = "5F7b5f1E01B83767.automaticDestinations-ms";
+        let app_id = extract_app_id(filename);
+        assert_eq!(app_id, Some("5f7b5f1e01b83767".to_string()));
+    }
+
+    #[test]
+    fn test_extract_app_id_too_short_hex() {
+        let filename = "5f7b5f1e.automaticDestinations-ms";
+        assert!(extract_app_id(filename).is_none());
+    }
+
+    #[test]
+    fn test_extract_app_id_too_long_hex() {
+        let filename = "5f7b5f1e01b837670.automaticDestinations-ms";
+        assert!(extract_app_id(filename).is_none());
+    }
+
+    #[test]
+    fn test_extract_app_id_non_hex() {
+        let filename = "5f7b5f1e01b8376g.automaticDestinations-ms"; // 'g' not hex
+        assert!(extract_app_id(filename).is_none());
+    }
+
+    #[test]
+    fn test_extract_app_id_no_dot() {
+        let filename = "5f7b5f1e01b83767automaticDestinations-ms";
+        assert!(extract_app_id(filename).is_none());
+    }
+
+    #[test]
+    fn test_extract_app_id_with_forward_slash_path() {
+        let filename = "path/to/5f7b5f1e01b83767.automaticDestinations-ms";
+        let app_id = extract_app_id(filename);
+        assert_eq!(app_id, Some("5f7b5f1e01b83767".to_string()));
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_bad_clsid() {
+        let mut data = vec![0u8; LNK_HEADER_SIZE];
+        data[0..4].copy_from_slice(&0x4Cu32.to_le_bytes()); // correct size
+        data[4..20].copy_from_slice(&[0xFF; 16]); // wrong CLSID
+        assert!(parse_embedded_lnk(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_zero_timestamps() {
+        let lnk = build_minimal_lnk(0, 0, 0);
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (path, cr, wr, ac) = result.unwrap();
+        assert!(path.is_none());
+        assert!(cr.is_none());
+        assert!(wr.is_none());
+        assert!(ac.is_none());
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_with_link_target_id_list() {
+        use chrono::TimeZone;
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        let mut lnk = vec![0u8; LNK_HEADER_SIZE + 10];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        // Set HAS_LINK_TARGET_ID_LIST flag
+        lnk[20..24].copy_from_slice(&HAS_LINK_TARGET_ID_LIST.to_le_bytes());
+        lnk[28..36].copy_from_slice(&datetime_to_filetime(created).to_le_bytes());
+        // IDListSize at offset 0x4C = 4 (small list)
+        lnk[LNK_HEADER_SIZE..LNK_HEADER_SIZE + 2].copy_from_slice(&4u16.to_le_bytes());
+        // 4 bytes of dummy IDList data
+        lnk.extend_from_slice(&[0u8; 4]);
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (_, cr, _, _) = result.unwrap();
+        assert_eq!(cr, Some(created));
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_empty_data() {
+        let data = vec![0u8; 10];
+        let results = parse_custom_destinations(&data, "test.customDestinations-ms").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_no_lnk_signatures() {
+        let data = vec![0xAA; 256];
+        let results = parse_custom_destinations(&data, "test.customDestinations-ms").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_multiple_lnks() {
+        use chrono::TimeZone;
+        let dt1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let dt2 = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+
+        let lnk1 = build_minimal_lnk(datetime_to_filetime(dt1), 0, datetime_to_filetime(dt1));
+        let lnk2 = build_minimal_lnk(datetime_to_filetime(dt2), 0, datetime_to_filetime(dt2));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&lnk1);
+        data.extend_from_slice(&[0xFF; 8]); // gap
+        data.extend_from_slice(&lnk2);
+
+        let results = parse_custom_destinations(&data, "test.customDestinations-ms").unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_datetime_to_filetime_roundtrip() {
+        use chrono::TimeZone;
+        let original = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        let ft = datetime_to_filetime(original);
+        let roundtrip = filetime_to_datetime(ft).unwrap();
+        assert_eq!(roundtrip, original);
+    }
+
+    #[test]
+    fn test_next_jumplist_id_monotonic() {
+        let id1 = next_jumplist_id();
+        let id2 = next_jumplist_id();
+        let id3 = next_jumplist_id();
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[test]
+    fn test_next_jumplist_id_has_jl_prefix() {
+        let id = next_jumplist_id();
+        // Top 2 bytes should be 0x4A4C ("JL")
+        assert_eq!((id >> 48) & 0xFFFF, 0x4A4C);
+    }
+
+    #[test]
+    fn test_lnk_constants() {
+        assert_eq!(LNK_HEADER_SIZE, 0x4C);
+        assert_eq!(LNK_CLSID.len(), 16);
+        assert_eq!(MAX_JUMPLIST_SIZE, 50_000_000);
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_exactly_header_size() {
+        // Exactly LNK_HEADER_SIZE bytes but valid header
+        let lnk = build_minimal_lnk(0, 0, 0);
+        assert_eq!(lnk.len(), LNK_HEADER_SIZE);
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_read_u32_le_zero() {
+        let data = [0u8; 4];
+        assert_eq!(read_u32_le(&data, 0), Some(0));
+    }
+
+    #[test]
+    fn test_read_u64_le_max() {
+        let data = [0xFF; 8];
+        assert_eq!(read_u64_le(&data, 0), Some(u64::MAX));
+    }
+
+    #[test]
+    fn test_read_u16_le_max() {
+        let data = [0xFF, 0xFF];
+        assert_eq!(read_u16_le(&data, 0), Some(u16::MAX));
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_with_link_info() {
+        // Build an LNK with HAS_LINK_INFO flag and a local base path
+        let mut lnk = vec![0u8; 200];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        // Set HAS_LINK_INFO flag only (no IDList)
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        // LinkInfo starts at offset 0x4C (no IDList to skip)
+        let info_start = LNK_HEADER_SIZE;
+        // LinkInfoSize = 100 (plenty of room)
+        lnk[info_start..info_start + 4].copy_from_slice(&100u32.to_le_bytes());
+        // LinkInfoHeaderSize
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes());
+        // LinkInfoFlags: VolumeIDAndLocalBasePath = 0x01
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&1u32.to_le_bytes());
+        // VolumeIDOffset
+        lnk[info_start + 12..info_start + 16].copy_from_slice(&28u32.to_le_bytes());
+        // LocalBasePathOffset - relative to info_start
+        let path_offset = 60u32;
+        lnk[info_start + 16..info_start + 20].copy_from_slice(&path_offset.to_le_bytes());
+
+        // Write path at info_start + path_offset
+        let path_str = b"C:\\Windows\\notepad.exe\x00";
+        let abs_offset = info_start + path_offset as usize;
+        lnk[abs_offset..abs_offset + path_str.len()].copy_from_slice(path_str);
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_some());
+        assert_eq!(target_path.unwrap(), r"C:\Windows\notepad.exe");
+    }
+
+    #[test]
+    fn test_parse_automatic_destinations_invalid_data() {
+        let data = vec![0u8; 100];
+        let result = parse_automatic_destinations(&data, "test.automaticDestinations-ms");
+        assert!(result.is_err());
+    }
 }

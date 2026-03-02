@@ -431,4 +431,189 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_forensic_filetime_negative_secs() {
+        // Very small filetime that results in negative secs
+        let ft = Filetime::new(1);
+        assert!(forensic_filetime_to_datetime(&ft).is_none());
+    }
+
+    #[test]
+    fn test_forensic_filetime_with_nanos() {
+        use chrono::TimeZone;
+        let dt_base = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let secs = dt_base.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000 + 1_000_000; // +100ms
+        let ft = Filetime::new(filetime);
+        let result = forensic_filetime_to_datetime(&ft).unwrap();
+        assert_eq!(result.timestamp_subsec_nanos(), 100_000_000);
+    }
+
+    #[test]
+    fn test_forensic_filetime_epoch_boundary() {
+        use chrono::TimeZone;
+        let epoch_diff: u64 = 11_644_473_600;
+        let filetime = epoch_diff * 10_000_000;
+        let ft = Filetime::new(filetime);
+        let result = forensic_filetime_to_datetime(&ft).unwrap();
+        assert_eq!(result, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_extract_pf_filename_windows_path() {
+        assert_eq!(
+            extract_pf_filename(r"C:\Windows\Prefetch\SVCHOST.EXE-ABCD1234.pf"),
+            "SVCHOST.EXE-ABCD1234.pf"
+        );
+    }
+
+    #[test]
+    fn test_extract_pf_filename_unix_path() {
+        assert_eq!(
+            extract_pf_filename("/collected/prefetch/CMD.EXE-12345678.pf"),
+            "CMD.EXE-12345678.pf"
+        );
+    }
+
+    #[test]
+    fn test_extract_pf_filename_just_filename() {
+        assert_eq!(
+            extract_pf_filename("NOTEPAD.EXE-D8414F97.pf"),
+            "NOTEPAD.EXE-D8414F97.pf"
+        );
+    }
+
+    #[test]
+    fn test_extract_pf_filename_empty() {
+        assert_eq!(extract_pf_filename(""), "");
+    }
+
+    #[test]
+    fn test_extract_pf_filename_trailing_separator() {
+        // Edge case: trailing separator results in empty last element
+        // But unwrap_or(path) should handle it
+        let result = extract_pf_filename("path/to/");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_in_memory_file_empty() {
+        let file = InMemoryFile::new(vec![]);
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.size, 0);
+    }
+
+    #[test]
+    fn test_in_memory_file_large() {
+        let data = vec![0xAA; 1_000_000];
+        let file = InMemoryFile::new(data);
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.size, 1_000_000);
+    }
+
+    #[test]
+    fn test_in_memory_file_seek_end() {
+        let data = vec![1, 2, 3, 4, 5];
+        let mut file = InMemoryFile::new(data);
+        let pos = file.seek(std::io::SeekFrom::End(-2)).unwrap();
+        assert_eq!(pos, 3);
+        let mut buf = [0u8; 2];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [4, 5]);
+    }
+
+    #[test]
+    fn test_in_memory_file_seek_current() {
+        let data = vec![10, 20, 30, 40, 50];
+        let mut file = InMemoryFile::new(data);
+        let mut buf = [0u8; 2];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [10, 20]);
+        // Seek 1 forward from current
+        file.seek(std::io::SeekFrom::Current(1)).unwrap();
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [40, 50]);
+    }
+
+    #[test]
+    fn test_in_memory_file_metadata_fields() {
+        let file = InMemoryFile::new(vec![0u8; 512]);
+        let meta = file.metadata().unwrap();
+        assert!(meta.created.is_none());
+        assert!(meta.accessed.is_none());
+        assert!(meta.modified.is_none());
+        assert!(matches!(meta.file_type, VFileType::File));
+    }
+
+    #[test]
+    fn test_next_prefetch_id_monotonic() {
+        let id1 = next_prefetch_id();
+        let id2 = next_prefetch_id();
+        let id3 = next_prefetch_id();
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[test]
+    fn test_next_prefetch_id_has_pf_prefix() {
+        let id = next_prefetch_id();
+        assert_eq!((id >> 48) & 0xFFFF, 0x5046);
+    }
+
+    #[test]
+    fn test_max_prefetch_size_constant() {
+        assert_eq!(MAX_PREFETCH_SIZE, 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_v17_multiple_attributes() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 3, 15, 14, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000;
+
+        let data = build_test_prefetch_v17("POWERSHELL.EXE", filetime, 100);
+        let vfile: Box<dyn VirtualFile> = Box::new(InMemoryFile::new(data));
+        let pf = read_prefetch_file("POWERSHELL.EXE-AE8EDC9B.pf", vfile).unwrap();
+
+        assert_eq!(pf.name, "POWERSHELL.EXE");
+        assert_eq!(pf.run_count, 100);
+        assert_eq!(pf.version, 17);
+    }
+
+    #[test]
+    fn test_parse_v17_zero_run_count() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000;
+
+        let data = build_test_prefetch_v17("TEST.EXE", filetime, 0);
+        let vfile: Box<dyn VirtualFile> = Box::new(InMemoryFile::new(data));
+        let pf = read_prefetch_file("TEST.EXE-00000000.pf", vfile).unwrap();
+        assert_eq!(pf.run_count, 0);
+    }
+
+    #[test]
+    fn test_forensic_filetime_far_future() {
+        use chrono::TimeZone;
+        // Year 2100
+        let dt = Utc.with_ymd_and_hms(2100, 12, 31, 23, 59, 59).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000;
+        let ft = Filetime::new(filetime);
+        let result = forensic_filetime_to_datetime(&ft).unwrap();
+        assert_eq!(result, dt);
+    }
+
+    #[test]
+    fn test_extract_pf_filename_mixed_separators() {
+        assert_eq!(
+            extract_pf_filename(r"C:\collected/prefetch\CMD.EXE-087B4001.pf"),
+            "CMD.EXE-087B4001.pf"
+        );
+    }
 }

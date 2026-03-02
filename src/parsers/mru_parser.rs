@@ -614,4 +614,318 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_filetime_negative_secs() {
+        // A filetime that would produce negative secs after subtracting epoch diff
+        // (i.e., before 1970-01-01). The EPOCH_DIFF is 11_644_473_600.
+        // If filetime / 10_000_000 < EPOCH_DIFF, secs < 0 => None
+        let filetime = 1u64; // way before Unix epoch
+        assert!(filetime_to_datetime(filetime).is_none());
+    }
+
+    #[test]
+    fn test_filetime_with_subsecond_nanos() {
+        use chrono::TimeZone;
+        // Build a filetime with sub-second precision
+        let dt_base = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let secs = dt_base.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000 + 5_000_000; // +0.5 seconds
+        let result = filetime_to_datetime(filetime).unwrap();
+        assert_eq!(result.timestamp(), dt_base.timestamp());
+        assert_eq!(result.timestamp_subsec_nanos(), 500_000_000);
+    }
+
+    #[test]
+    fn test_filetime_boundary_exactly_epoch() {
+        use chrono::TimeZone;
+        // Exactly 1970-01-01 00:00:00 UTC
+        let epoch_diff: u64 = 11_644_473_600;
+        let filetime = epoch_diff * 10_000_000;
+        let result = filetime_to_datetime(filetime).unwrap();
+        assert_eq!(result, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_parse_mrulistex_single_entry() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&42u32.to_le_bytes());
+        data.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        let order = parse_mrulistex(&data);
+        assert_eq!(order, vec![42]);
+    }
+
+    #[test]
+    fn test_parse_mrulistex_all_zeros() {
+        // Entries of value 0 are valid (index 0), terminator is 0xFFFFFFFF
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        let order = parse_mrulistex(&data);
+        assert_eq!(order, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_parse_mrulistex_trailing_bytes_ignored() {
+        // 3 bytes after valid entries (not a full chunk) should be ignored
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // trailing garbage
+        let order = parse_mrulistex(&data);
+        assert_eq!(order, vec![1]);
+    }
+
+    #[test]
+    fn test_parse_mrulistex_empty_data() {
+        let data: Vec<u8> = Vec::new();
+        let order = parse_mrulistex(&data);
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_unicode() {
+        // Test with a filename containing unicode (Chinese characters)
+        let filename = "report_\u{4e2d}\u{6587}.docx";
+        let mut data: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&[0, 0]); // null terminator
+        data.extend_from_slice(&[0xFF; 10]); // extra shell data
+
+        let result = extract_filename_from_recentdocs(&data);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("report_"));
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_only_whitespace() {
+        // Non-alphanumeric content should return None
+        let filename = "   ";
+        let mut data: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&[0, 0]);
+
+        let result = extract_filename_from_recentdocs(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_exactly_4_bytes() {
+        // Exactly 4 bytes = 2 UTF-16 chars
+        let filename = "AB";
+        let data: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(data.len(), 4);
+        let result = extract_filename_from_recentdocs(&data);
+        assert_eq!(result, Some("AB".to_string()));
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_3_bytes() {
+        // Less than 4 bytes returns None
+        let data = vec![0x41, 0x00, 0x42];
+        assert!(extract_filename_from_recentdocs(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_too_short() {
+        let data = vec![0u8; 7]; // less than 8
+        assert!(extract_filename_from_pidl(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_no_utf16_sequences() {
+        // All high bytes, no valid UTF-16LE patterns
+        let data = vec![0xFF; 20];
+        assert!(extract_filename_from_pidl(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_with_backslash_path() {
+        // A PIDL-like blob with a backslash-containing path
+        let mut data = vec![0u8; 10]; // header
+        let path = r"C:\Users\test\file.txt";
+        let utf16: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16);
+        data.extend_from_slice(&[0, 0]); // null terminator
+
+        let result = extract_filename_from_pidl(&data);
+        assert!(result.is_some());
+        let name = result.unwrap();
+        assert!(name.contains("Users") || name.contains("file.txt"));
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_prefers_filename_over_generic_string() {
+        // Put both a short generic string and a longer filename with dot
+        let mut data = vec![0u8; 10];
+        // Short generic string first
+        let generic = "abc";
+        let utf16_gen: Vec<u8> = generic
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16_gen);
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&[0xFF; 4]); // separator
+        // Then a longer filename with a dot
+        let filename = "important_document.pdf";
+        let utf16_fn: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16_fn);
+        data.extend_from_slice(&[0, 0]);
+
+        let result = extract_filename_from_pidl(&data);
+        assert!(result.is_some());
+        // Should prefer the longer filename-like string (contains a dot)
+        let name = result.unwrap();
+        assert!(name.contains("important_document.pdf"));
+    }
+
+    #[test]
+    fn test_mru_entry_fields() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 3, 15, 8, 0, 0).unwrap();
+        let entry = MruEntry {
+            name: "budget_2025.xlsx".to_string(),
+            timestamp: dt,
+            source_key: "RecentDocs\\.xlsx".to_string(),
+            mru_position: 3,
+        };
+        assert_eq!(entry.name, "budget_2025.xlsx");
+        assert_eq!(entry.timestamp, dt);
+        assert_eq!(entry.source_key, "RecentDocs\\.xlsx");
+        assert_eq!(entry.mru_position, 3);
+    }
+
+    #[test]
+    fn test_mru_entry_clone() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = MruEntry {
+            name: "test.txt".to_string(),
+            timestamp: dt,
+            source_key: "RecentDocs".to_string(),
+            mru_position: 0,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.name, entry.name);
+        assert_eq!(cloned.timestamp, entry.timestamp);
+        assert_eq!(cloned.source_key, entry.source_key);
+        assert_eq!(cloned.mru_position, entry.mru_position);
+    }
+
+    #[test]
+    fn test_mru_entry_debug_format() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = MruEntry {
+            name: "file.doc".to_string(),
+            timestamp: dt,
+            source_key: "RecentDocs".to_string(),
+            mru_position: 0,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("MruEntry"));
+        assert!(debug_str.contains("file.doc"));
+    }
+
+    #[test]
+    fn test_next_mru_id_monotonic() {
+        let id1 = next_mru_id();
+        let id2 = next_mru_id();
+        let id3 = next_mru_id();
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[test]
+    fn test_timeline_entry_source_is_registry_mru() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_mru_id()),
+            path: "[MRU:RecentDocs] test.txt".to_string(),
+            primary_timestamp: dt,
+            event_type: EventType::FileAccess,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Registry("MRU".to_string())],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert!(matches!(&entry.sources[0], ArtifactSource::Registry(s) if s == "MRU"));
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_long_name() {
+        // Test with a very long filename
+        let long_name = "a".repeat(260); // MAX_PATH length
+        let mut data: Vec<u8> = long_name
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&[0, 0]);
+        let result = extract_filename_from_recentdocs(&data);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 260);
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_special_chars() {
+        let filename = "report (1) - final [v2].docx";
+        let mut data: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&[0xFF; 8]);
+        let result = extract_filename_from_recentdocs(&data);
+        assert_eq!(result, Some("report (1) - final [v2].docx".to_string()));
+    }
+
+    #[test]
+    fn test_parse_mrulistex_large_indices() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xFFFFFFFEu32.to_le_bytes()); // large but not terminator
+        data.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // terminator
+        let order = parse_mrulistex(&data);
+        assert_eq!(order, vec![0xFFFFFFFE]);
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_exactly_8_bytes() {
+        // Minimum valid size for pidl - all zeros => no valid UTF-16 sequences
+        let data = vec![0u8; 8];
+        assert!(extract_filename_from_pidl(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_forward_slash_path() {
+        let mut data = vec![0u8; 10];
+        let path = "home/user/notes.txt";
+        let utf16: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16);
+        data.extend_from_slice(&[0, 0]);
+
+        let result = extract_filename_from_pidl(&data);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("notes.txt"));
+    }
 }

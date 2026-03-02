@@ -129,4 +129,137 @@ mod tests {
         assert!(store.get(1).is_some());
         assert!(store.get(2).is_none());
     }
+
+    // ─── new() ──────────────────────────────────────────────
+
+    #[test]
+    fn test_new_is_empty_and_sorted() {
+        let store = TimelineStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        assert!(store.is_sorted());
+    }
+
+    // ─── with_capacity ──────────────────────────────────────
+
+    #[test]
+    fn test_with_capacity_is_empty() {
+        let store = TimelineStore::with_capacity(100);
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        assert!(store.is_sorted());
+    }
+
+    // ─── push marks unsorted ────────────────────────────────
+
+    #[test]
+    fn test_push_marks_unsorted() {
+        let mut store = TimelineStore::new();
+        assert!(store.is_sorted());
+        store.push(make_entry(2025, 1, 1));
+        assert!(!store.is_sorted());
+    }
+
+    // ─── sort idempotent ────────────────────────────────────
+
+    #[test]
+    fn test_sort_marks_sorted() {
+        let mut store = TimelineStore::new();
+        store.push(make_entry(2025, 3, 1));
+        store.push(make_entry(2025, 1, 1));
+        assert!(!store.is_sorted());
+
+        store.sort();
+        assert!(store.is_sorted());
+
+        // Calling sort again on already-sorted store should be fine
+        store.sort();
+        assert!(store.is_sorted());
+    }
+
+    #[test]
+    fn test_sort_produces_chronological_order() {
+        let mut store = TimelineStore::new();
+        store.push(make_entry(2025, 12, 31));
+        store.push(make_entry(2020, 1, 1));
+        store.push(make_entry(2023, 6, 15));
+
+        store.sort();
+
+        let paths: Vec<&str> = store.entries().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["test_2020-1-1", "test_2023-6-15", "test_2025-12-31"]);
+    }
+
+    // ─── get returns correct entry ──────────────────────────
+
+    #[test]
+    fn test_get_returns_correct_path() {
+        let mut store = TimelineStore::new();
+        store.push(make_entry(2025, 1, 1));
+        store.push(make_entry(2025, 6, 15));
+
+        let e0 = store.get(0).unwrap();
+        assert_eq!(e0.path, "test_2025-1-1");
+
+        let e1 = store.get(1).unwrap();
+        assert_eq!(e1.path, "test_2025-6-15");
+    }
+
+    #[test]
+    fn test_get_out_of_bounds() {
+        let store = TimelineStore::new();
+        assert!(store.get(0).is_none());
+    }
+
+    // ─── entries iterator ───────────────────────────────────
+
+    #[test]
+    fn test_entries_returns_all() {
+        let mut store = TimelineStore::new();
+        store.push(make_entry(2020, 1, 1));
+        store.push(make_entry(2021, 1, 1));
+        store.push(make_entry(2022, 1, 1));
+
+        let paths: Vec<&str> = store.entries().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths.len(), 3);
+    }
+
+    // ─── entries_mut iterator ───────────────────────────────
+
+    #[test]
+    fn test_entries_mut_allows_modification() {
+        let mut store = TimelineStore::new();
+        store.push(make_entry(2020, 1, 1));
+        store.push(make_entry(2021, 1, 1));
+
+        for entry in store.entries_mut() {
+            entry.path = format!("modified_{}", entry.path);
+        }
+
+        assert!(store.get(0).unwrap().path.starts_with("modified_"));
+        assert!(store.get(1).unwrap().path.starts_with("modified_"));
+    }
+
+    // ─── default trait ──────────────────────────────────────
+
+    #[test]
+    fn test_default_creates_empty_store() {
+        let store = TimelineStore::default();
+        assert!(store.is_empty());
+        assert!(store.is_sorted());
+    }
+
+    // ─── len after multiple operations ──────────────────────
+
+    #[test]
+    fn test_len_tracks_pushes() {
+        let mut store = TimelineStore::new();
+        assert_eq!(store.len(), 0);
+        store.push(make_entry(2020, 1, 1));
+        assert_eq!(store.len(), 1);
+        store.push(make_entry(2021, 1, 1));
+        assert_eq!(store.len(), 2);
+        store.push(make_entry(2022, 1, 1));
+        assert_eq!(store.len(), 3);
+    }
 }

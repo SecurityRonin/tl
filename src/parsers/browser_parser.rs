@@ -349,6 +349,243 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ─── next_browser_id tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_next_browser_id_increments() {
+        let id1 = next_browser_id();
+        let id2 = next_browser_id();
+        assert!(id2 > id1);
+        assert_eq!(id2 - id1, 1);
+    }
+
+    #[test]
+    fn test_next_browser_id_has_br_prefix() {
+        let id = next_browser_id();
+        let prefix = (id >> 48) & 0xFFFF;
+        assert_eq!(prefix, 0x4252);
+    }
+
+    // ─── chrome_time_to_datetime edge cases ─────────────────────────────
+
+    #[test]
+    fn test_chrome_time_pre_unix_epoch() {
+        // A Chrome time between 1601 and 1970 should return None
+        // (because unix_usec would be negative)
+        let chrome_time: i64 = 1_000_000; // Only 1 second after Chrome epoch
+        assert!(chrome_time_to_datetime(chrome_time).is_none());
+    }
+
+    #[test]
+    fn test_chrome_time_preserves_microseconds() {
+        // Test that sub-second precision is preserved
+        let unix_usec: i64 = 1736942400_500_000; // 2025-01-15 12:00:00.5
+        let chrome_time = unix_usec + 11_644_473_600_000_000;
+        let dt = chrome_time_to_datetime(chrome_time).unwrap();
+        // 500,000 microseconds = 500,000,000 nanoseconds
+        assert_eq!(dt.timestamp_subsec_micros(), 500_000);
+    }
+
+    #[test]
+    fn test_chrome_time_at_unix_epoch() {
+        // Chrome time at Unix epoch: 11644473600 * 1_000_000
+        let chrome_time: i64 = 11_644_473_600_000_000;
+        let dt = chrome_time_to_datetime(chrome_time).unwrap();
+        assert_eq!(dt.timestamp(), 0);
+    }
+
+    #[test]
+    fn test_chrome_time_large_value() {
+        // A very large but valid Chrome time
+        // 2030-01-01 00:00:00 UTC
+        let unix_ts: i64 = 1893456000;
+        let chrome_time = unix_ts * 1_000_000 + 11_644_473_600_000_000;
+        let dt = chrome_time_to_datetime(chrome_time).unwrap();
+        assert_eq!(dt.format("%Y").to_string(), "2030");
+    }
+
+    // ─── firefox_time_to_datetime edge cases ────────────────────────────
+
+    #[test]
+    fn test_firefox_time_negative() {
+        assert!(firefox_time_to_datetime(-1).is_none());
+    }
+
+    #[test]
+    fn test_firefox_time_preserves_microseconds() {
+        let moz_time: i64 = 1736942400_250_000; // 0.25 seconds
+        let dt = firefox_time_to_datetime(moz_time).unwrap();
+        assert_eq!(dt.timestamp_subsec_micros(), 250_000);
+    }
+
+    #[test]
+    fn test_firefox_time_at_epoch() {
+        // 1 microsecond after epoch
+        let dt = firefox_time_to_datetime(1).unwrap();
+        assert_eq!(dt.timestamp(), 0);
+        assert_eq!(dt.timestamp_subsec_micros(), 1);
+    }
+
+    #[test]
+    fn test_firefox_time_year_2030() {
+        let unix_ts: i64 = 1893456000;
+        let moz_time = unix_ts * 1_000_000;
+        let dt = firefox_time_to_datetime(moz_time).unwrap();
+        assert_eq!(dt.format("%Y").to_string(), "2030");
+    }
+
+    // ─── detect_browser edge cases ──────────────────────────────────────
+
+    #[test]
+    fn test_detect_browser_case_insensitive() {
+        assert_eq!(detect_browser("FIREFOX"), BrowserType::Firefox);
+        assert_eq!(detect_browser("EDGE"), BrowserType::Edge);
+        assert_eq!(detect_browser("MOZILLA"), BrowserType::Firefox);
+    }
+
+    #[test]
+    fn test_detect_browser_unknown_defaults_chrome() {
+        assert_eq!(detect_browser("somedb.sqlite"), BrowserType::Chrome);
+        assert_eq!(detect_browser(""), BrowserType::Chrome);
+    }
+
+    #[test]
+    fn test_detect_browser_mixed_case() {
+        assert_eq!(
+            detect_browser(r"C:\Users\Admin\AppData\Local\Mozilla\Firefox\profile\places.sqlite"),
+            BrowserType::Firefox
+        );
+    }
+
+    #[test]
+    fn test_detect_browser_edge_in_path() {
+        assert_eq!(
+            detect_browser(r"C:\Users\test\AppData\Local\Microsoft\Edge\User Data\Default\History"),
+            BrowserType::Edge
+        );
+    }
+
+    #[test]
+    fn test_detect_browser_mozilla_keyword() {
+        assert_eq!(detect_browser("some/mozilla/path"), BrowserType::Firefox);
+    }
+
+    // ─── BrowserType tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_browser_type_equality() {
+        assert_eq!(BrowserType::Chrome, BrowserType::Chrome);
+        assert_ne!(BrowserType::Chrome, BrowserType::Firefox);
+        assert_ne!(BrowserType::Firefox, BrowserType::Edge);
+    }
+
+    #[test]
+    fn test_browser_type_clone() {
+        let browser = BrowserType::Firefox;
+        let cloned = browser.clone();
+        assert_eq!(browser, cloned);
+    }
+
+    #[test]
+    fn test_browser_type_debug() {
+        let debug_str = format!("{:?}", BrowserType::Chrome);
+        assert_eq!(debug_str, "Chrome");
+        let debug_str = format!("{:?}", BrowserType::Edge);
+        assert_eq!(debug_str, "Edge");
+        let debug_str = format!("{:?}", BrowserType::Firefox);
+        assert_eq!(debug_str, "Firefox");
+    }
+
+    // ─── BrowserHistoryEntry tests ──────────────────────────────────────
+
+    #[test]
+    fn test_browser_history_entry_clone() {
+        let entry = BrowserHistoryEntry {
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            visit_time: Utc::now(),
+            visit_count: 5,
+            browser: BrowserType::Chrome,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.url, entry.url);
+        assert_eq!(cloned.visit_count, entry.visit_count);
+        assert_eq!(cloned.browser, entry.browser);
+    }
+
+    #[test]
+    fn test_browser_history_entry_empty_title() {
+        let entry = BrowserHistoryEntry {
+            url: "https://example.com".to_string(),
+            title: String::new(),
+            visit_time: Utc::now(),
+            visit_count: 1,
+            browser: BrowserType::Firefox,
+        };
+        assert!(entry.title.is_empty());
+    }
+
+    #[test]
+    fn test_browser_history_entry_high_visit_count() {
+        let entry = BrowserHistoryEntry {
+            url: "https://daily.com".to_string(),
+            title: "Daily".to_string(),
+            visit_time: Utc::now(),
+            visit_count: 99999,
+            browser: BrowserType::Edge,
+        };
+        assert_eq!(entry.visit_count, 99999);
+    }
+
+    // ─── Timeline entry description formatting ──────────────────────────
+
+    #[test]
+    fn test_browser_timeline_entry_with_title() {
+        let entry = BrowserHistoryEntry {
+            url: "https://evil.com".to_string(),
+            title: "Phishing Page".to_string(),
+            visit_time: Utc::now(),
+            visit_count: 1,
+            browser: BrowserType::Chrome,
+        };
+        let browser_name = "Chrome";
+        let title_display = if entry.title.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", entry.title)
+        };
+        let path = format!(
+            "[{}:History]{} {} (visits: {})",
+            browser_name, title_display, entry.url, entry.visit_count
+        );
+        assert!(path.contains("\"Phishing Page\""));
+        assert!(path.contains("https://evil.com"));
+        assert!(path.contains("visits: 1"));
+    }
+
+    #[test]
+    fn test_browser_timeline_entry_without_title() {
+        let entry = BrowserHistoryEntry {
+            url: "https://no-title.com".to_string(),
+            title: String::new(),
+            visit_time: Utc::now(),
+            visit_count: 2,
+            browser: BrowserType::Firefox,
+        };
+        let browser_name = "Firefox";
+        let title_display = if entry.title.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", entry.title)
+        };
+        let path = format!(
+            "[{}:History]{} {} (visits: {})",
+            browser_name, title_display, entry.url, entry.visit_count
+        );
+        assert!(!path.contains("\"\""));
+        assert!(path.contains("[Firefox:History] https://no-title.com"));
+    }
+
     #[test]
     fn test_empty_manifest_no_error() {
         let manifest = ArtifactManifest::default();

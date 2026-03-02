@@ -261,4 +261,114 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_extract_username_forward_slash_path() {
+        let path = "C:/Users/forensic_analyst/AppData/Local/Microsoft/Terminal Server Client/Cache/bcache24.bmc";
+        assert_eq!(extract_username_from_path(path), "forensic_analyst");
+    }
+
+    #[test]
+    fn test_extract_username_case_insensitive() {
+        let path = r"C:\users\Admin\AppData\Cache\bcache.bmc";
+        assert_eq!(extract_username_from_path(path), "Admin");
+    }
+
+    #[test]
+    fn test_extract_username_users_at_end() {
+        // "Users" is the last component -- no username after it
+        let path = r"C:\Users";
+        assert_eq!(extract_username_from_path(path), "Unknown");
+    }
+
+    #[test]
+    fn test_extract_filename_forward_slash() {
+        assert_eq!(extract_filename("C:/path/to/bcache24.bmc"), "bcache24.bmc");
+    }
+
+    #[test]
+    fn test_extract_filename_empty_string() {
+        assert_eq!(extract_filename(""), "");
+    }
+
+    #[test]
+    fn test_analyze_bmc_exactly_16_bytes() {
+        // Exactly at the minimum: len >= 16 is true
+        let data = vec![0u8; 16];
+        let summary = analyze_bmc_file(&data, "test.bmc");
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        // 16 bytes < 128, so estimated_tiles = 0, but max(1) = 1
+        assert_eq!(s.tile_count, 1);
+        assert_eq!(s.version, "Unknown");
+    }
+
+    #[test]
+    fn test_analyze_bmc_just_above_128_bytes() {
+        // data.len() = 129, which is > 128, so 129/16384 = 0, but max(1) = 1
+        let data = vec![0u8; 129];
+        let summary = analyze_bmc_file(&data, "test.bmc").unwrap();
+        assert_eq!(summary.tile_count, 1);
+    }
+
+    #[test]
+    fn test_analyze_bmc_large_file_tile_count() {
+        // 10 * 16384 = 163840 bytes -> 10 tiles
+        let data = vec![0u8; 163840];
+        let summary = analyze_bmc_file(&data, "test.bmc").unwrap();
+        assert_eq!(summary.tile_count, 10);
+    }
+
+    #[test]
+    fn test_analyze_bmc_file_size_stored() {
+        let data = vec![0xFFu8; 500];
+        let summary = analyze_bmc_file(&data, "test.bmc").unwrap();
+        assert_eq!(summary.file_size, 500);
+    }
+
+    #[test]
+    fn test_analyze_bmc_15_bytes_returns_none() {
+        let data = vec![0u8; 15];
+        assert!(analyze_bmc_file(&data, "tiny.bmc").is_none());
+    }
+
+    #[test]
+    fn test_next_rdpcache_id_increments() {
+        let id1 = next_rdpcache_id();
+        let id2 = next_rdpcache_id();
+        assert!(id2 > id1);
+        // Both should have the "RC" prefix
+        assert_eq!(id1 >> 48, 0x5243);
+        assert_eq!(id2 >> 48, 0x5243);
+    }
+
+    #[test]
+    fn test_rdp_cache_summary_debug_impl() {
+        let summary = RdpCacheSummary {
+            filename: "bcache0.bmc".to_string(),
+            file_size: 100,
+            tile_count: 1,
+            version: "RDP8+".to_string(),
+            username: "test".to_string(),
+        };
+        let debug_str = format!("{:?}", summary);
+        assert!(debug_str.contains("bcache0.bmc"));
+        assert!(debug_str.contains("RDP8+"));
+    }
+
+    #[test]
+    fn test_rdp_cache_summary_clone() {
+        let summary = RdpCacheSummary {
+            filename: "bcache0.bmc".to_string(),
+            file_size: 100,
+            tile_count: 1,
+            version: "RDP8+".to_string(),
+            username: "test".to_string(),
+        };
+        let cloned = summary.clone();
+        assert_eq!(cloned.filename, summary.filename);
+        assert_eq!(cloned.file_size, summary.file_size);
+    }
 }

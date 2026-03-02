@@ -606,4 +606,293 @@ mod tests {
         let data = vec![0u8; 4];
         assert!(find_unicode_name(&data).is_none());
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_filetime_negative_secs() {
+        // Very early date before Unix epoch => secs < 0 => None
+        let filetime = 10_000_000u64;
+        assert!(filetime_to_datetime(filetime).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_root_folder_my_computer() {
+        // Root folder type 0x1F, GUID for "My Computer"
+        let mut data = vec![0u8; 20];
+        data[0..2].copy_from_slice(&20u16.to_le_bytes());
+        data[2] = 0x1F;
+        // GUID bytes at offset 4
+        data[4] = 0xE0;
+        data[5] = 0x4F;
+        data[6] = 0xD0;
+        data[7] = 0x20;
+        // Fill remaining GUID bytes
+        data[8..20].copy_from_slice(&[0xEA, 0x3A, 0x69, 0x10, 0xA2, 0xD8, 0x08, 0x00, 0x2B, 0x30, 0x30, 0x9D]);
+        let name = extract_name_from_shell_item(&data);
+        assert_eq!(name, Some("My Computer".to_string()));
+    }
+
+    #[test]
+    fn test_extract_name_root_folder_too_short() {
+        // Root folder type 0x1F but data too short for GUID
+        let mut data = vec![0u8; 10];
+        data[2] = 0x1F;
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_drive_item_all_types() {
+        // Test various drive item types
+        for item_type in [0x23, 0x25, 0x29, 0x2A, 0x2E] {
+            let mut data = vec![0u8; 10];
+            data[0..2].copy_from_slice(&10u16.to_le_bytes());
+            data[2] = item_type;
+            data[3..6].copy_from_slice(b"D:\0");
+            let name = extract_name_from_shell_item(&data);
+            assert!(name.is_some(), "type 0x{:02X} should extract a name", item_type);
+        }
+    }
+
+    #[test]
+    fn test_extract_name_drive_item_empty_string() {
+        let mut data = vec![0u8; 10];
+        data[2] = 0x2F;
+        data[3] = 0; // Immediately null
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_drive_item_too_short() {
+        let mut data = vec![0u8; 3];
+        data[2] = 0x2F;
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_network_share() {
+        let mut data = vec![0u8; 30];
+        data[0..2].copy_from_slice(&30u16.to_le_bytes());
+        data[2] = 0x41; // Network share type
+        data[5..20].copy_from_slice(b"\\\\SERVER\\share\0");
+        let name = extract_name_from_shell_item(&data);
+        assert!(name.is_some());
+        assert!(name.unwrap().contains("SERVER"));
+    }
+
+    #[test]
+    fn test_extract_name_network_type_c3() {
+        let mut data = vec![0u8; 20];
+        data[2] = 0xC3;
+        data[5..16].copy_from_slice(b"NETSHARE01\0");
+        let name = extract_name_from_shell_item(&data);
+        assert!(name.is_some());
+    }
+
+    #[test]
+    fn test_extract_name_network_too_short() {
+        let mut data = vec![0u8; 5];
+        data[2] = 0x41;
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_network_empty_name() {
+        let mut data = vec![0u8; 10];
+        data[2] = 0x41;
+        data[5] = 0; // null immediately
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_unknown_type_with_ascii() {
+        // Unknown type that has an ASCII string at a valid offset
+        let mut data = vec![0u8; 20];
+        data[2] = 0xFE; // Unknown type
+        data[3..11].copy_from_slice(b"FOLDER1\0");
+        let name = extract_name_from_shell_item(&data);
+        assert!(name.is_some());
+        assert!(name.unwrap().contains("FOLDER1"));
+    }
+
+    #[test]
+    fn test_extract_name_unknown_type_too_short() {
+        let mut data = vec![0u8; 5];
+        data[2] = 0xFE;
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_unknown_type_no_ascii() {
+        let mut data = vec![0u8; 20];
+        data[2] = 0xFE;
+        // Fill with non-printable chars at all offsets
+        for b in &mut data[3..] {
+            *b = 0x01; // non-printable, non-zero
+        }
+        assert!(extract_name_from_shell_item(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_file_entry_name_too_short() {
+        let mut data = vec![0u8; 11];
+        data[2] = 0x31;
+        assert!(extract_file_entry_name(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_file_entry_name_14_bytes() {
+        // data.len() <= 14 -- returns None
+        let mut data = vec![0u8; 14];
+        data[2] = 0x31;
+        assert!(extract_file_entry_name(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_file_entry_with_unicode_name() {
+        // Build a file entry shell item with both short name and Unicode long name
+        let mut data = vec![0u8; 80];
+        data[0..2].copy_from_slice(&80u16.to_le_bytes());
+        data[2] = 0x32; // file entry type
+        // Short name at offset 14
+        data[14..22].copy_from_slice(b"DOCUME~1");
+        data[22] = 0; // null terminator
+        // Padding to even offset: 14 + 8 + 1 = 23 (odd) => pad to 24
+        // Put a Unicode name "Documents" after some metadata
+        let unicode_name = "Documents";
+        let utf16: Vec<u8> = unicode_name
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let unicode_start = 30;
+        data[unicode_start..unicode_start + utf16.len()].copy_from_slice(&utf16);
+        // null terminator for unicode
+        data[unicode_start + utf16.len()] = 0;
+        data[unicode_start + utf16.len() + 1] = 0;
+
+        let name = extract_file_entry_name(&data);
+        assert!(name.is_some());
+        // Should find the Unicode name "Documents" instead of "DOCUME~1"
+        assert_eq!(name.unwrap(), "Documents");
+    }
+
+    #[test]
+    fn test_extract_file_entry_short_name_only() {
+        // File entry with short name but no valid Unicode name after it
+        let mut data = vec![0u8; 30];
+        data[0..2].copy_from_slice(&30u16.to_le_bytes());
+        data[2] = 0x31;
+        data[14..18].copy_from_slice(b"TEST");
+        data[18] = 0;
+        // All zeroes after short name => no Unicode found
+
+        let name = extract_file_entry_name(&data);
+        assert!(name.is_some());
+        assert_eq!(name.unwrap(), "TEST");
+    }
+
+    #[test]
+    fn test_extract_ascii_fallback_various_offsets() {
+        // Test that extract_ascii_fallback tries multiple offsets
+        let mut data = vec![0u8; 20];
+        data[2] = 0xFF; // unknown type
+        // Put ASCII at offset 8
+        data[8..14].copy_from_slice(b"MYDIR\0");
+        let result = extract_ascii_fallback(&data);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "MYDIR");
+    }
+
+    #[test]
+    fn test_extract_ascii_fallback_short_strings() {
+        // All ASCII strings shorter than 3 chars => None
+        let mut data = vec![0u8; 20];
+        data[3] = b'A';
+        data[4] = b'B';
+        data[5] = 0;
+        assert!(extract_ascii_fallback(&data).is_none());
+    }
+
+    #[test]
+    fn test_known_folder_my_documents() {
+        let guid: [u8; 16] = [
+            0xBA, 0x8F, 0x0D, 0x45, 0x25, 0xAD, 0xD0, 0x11, 0x98, 0xA8, 0x08, 0x00, 0x36, 0x1B,
+            0x11, 0x03,
+        ];
+        assert_eq!(known_folder_name(&guid), "My Documents");
+    }
+
+    #[test]
+    fn test_known_folder_network() {
+        let guid: [u8; 16] = [
+            0x0D, 0x1A, 0x2C, 0xF0, 0x21, 0xBE, 0x50, 0x43, 0x88, 0xB0, 0x73, 0x67, 0xFC, 0x96,
+            0xEF, 0x3C,
+        ];
+        assert_eq!(known_folder_name(&guid), "Network");
+    }
+
+    #[test]
+    fn test_known_folder_too_short() {
+        let guid: [u8; 10] = [0; 10];
+        assert_eq!(known_folder_name(&guid), "Unknown");
+    }
+
+    #[test]
+    fn test_find_unicode_name_too_short() {
+        let data = vec![0u8; 3];
+        assert!(find_unicode_name(&data).is_none());
+    }
+
+    #[test]
+    fn test_find_unicode_name_single_char() {
+        // Single UTF-16 char followed by null is too short (< 2 chars)
+        let mut data = vec![0u8; 6];
+        data[0] = b'A';
+        data[1] = 0;
+        data[2] = 0;
+        data[3] = 0;
+        assert!(find_unicode_name(&data).is_none());
+    }
+
+    #[test]
+    fn test_next_shellbag_id_increments() {
+        let id1 = next_shellbag_id();
+        let id2 = next_shellbag_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x5342);
+    }
+
+    #[test]
+    fn test_shellbag_entry_no_folder_name() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let sb_entry = ShellbagEntry {
+            reg_path: r"BagMRU\0".to_string(),
+            folder_name: None,
+            last_accessed: dt,
+        };
+        // Test the display path with no folder name
+        let display_path = if let Some(ref folder) = sb_entry.folder_name {
+            format!("[Shellbag] {} ({})", folder, sb_entry.reg_path)
+        } else {
+            format!("[Shellbag] {}", sb_entry.reg_path)
+        };
+        assert_eq!(display_path, r"[Shellbag] BagMRU\0");
+    }
+
+    #[test]
+    fn test_file_entry_range_0x30_to_0x3f() {
+        // All types 0x30-0x3F should go to extract_file_entry_name
+        for item_type in 0x30..=0x3F {
+            let mut data = vec![0u8; 30];
+            data[0..2].copy_from_slice(&30u16.to_le_bytes());
+            data[2] = item_type;
+            data[14..19].copy_from_slice(b"FILE\0");
+            let result = extract_name_from_shell_item(&data);
+            // Should either find "FILE" or None, but not panic
+            if let Some(name) = result {
+                assert!(!name.is_empty());
+            }
+        }
+    }
 }

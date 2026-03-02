@@ -452,4 +452,199 @@ mod tests {
         let result = decode_utf16le_null_terminated(&encoded);
         assert_eq!(result, s);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_filetime_negative_secs() {
+        // A FILETIME that results in secs < 0 after subtracting epoch
+        // 1 second = 10_000_000 ticks. Use a value where secs < EPOCH_DIFF
+        let filetime = 10_000_000u64; // 1 second since 1601 => way before 1970
+        assert!(filetime_to_datetime(filetime).is_none());
+    }
+
+    #[test]
+    fn test_filetime_with_subsecond_precision() {
+        use chrono::TimeZone;
+        // Create a FILETIME with non-zero nanoseconds component
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+        let base_ft = datetime_to_filetime(dt);
+        // Add 5_000_000 ticks = 0.5 seconds
+        let ft_with_nanos = base_ft + 5_000_000;
+        let result = filetime_to_datetime(ft_with_nanos).unwrap();
+        assert_eq!(result.timestamp(), dt.timestamp());
+        assert!(result.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn test_read_u32_le_boundary() {
+        // Exact boundary: offset + 4 == data.len()
+        let data = [0x01, 0x02, 0x03, 0x04];
+        assert_eq!(read_u32_le(&data, 0), Some(0x04030201));
+        // Out of bounds
+        assert!(read_u32_le(&data, 1).is_none());
+    }
+
+    #[test]
+    fn test_read_u64_le_boundary() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        assert_eq!(read_u64_le(&data, 0), Some(0x0807060504030201));
+        assert!(read_u64_le(&data, 1).is_none());
+    }
+
+    #[test]
+    fn test_read_u32_le_empty() {
+        let data: [u8; 0] = [];
+        assert!(read_u32_le(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_u64_le_empty() {
+        let data: [u8; 0] = [];
+        assert!(read_u64_le(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_decode_utf16le_null_terminated_empty() {
+        let data: Vec<u8> = vec![0, 0]; // Just a null terminator
+        let result = decode_utf16le_null_terminated(&data);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_decode_utf16le_null_terminated_no_null() {
+        // No null terminator - should decode entire string
+        let s = "ABC";
+        let encoded: Vec<u8> = s
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let result = decode_utf16le_null_terminated(&encoded);
+        assert_eq!(result, "ABC");
+    }
+
+    #[test]
+    fn test_decode_utf16le_null_terminated_odd_bytes() {
+        // Odd number of bytes: last byte should be ignored by chunks_exact
+        let data: Vec<u8> = vec![0x41, 0x00, 0xFF]; // 'A' + stray byte
+        let result = decode_utf16le_null_terminated(&data);
+        assert_eq!(result, "A");
+    }
+
+    #[test]
+    fn test_parse_i_file_v1_too_short_for_path() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        // Version 1 but only 27 bytes (need at least 24 + 4 = 28 for path)
+        let mut data = vec![0u8; 27];
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_i_file_v2_zero_path_length() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let mut data = vec![0u8; 32];
+        data[0..8].copy_from_slice(&2u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        // path length = 0 at offset 24
+        data[24..28].copy_from_slice(&0u32.to_le_bytes());
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_i_file_v2_truncated_path() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+        let path_str = r"C:\test.txt";
+        let path_utf16: Vec<u8> = path_str
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        // Declare a path length larger than available data
+        let char_count = 100u32; // way more than we'll provide
+
+        let mut data = vec![0u8; 28 + path_utf16.len()];
+        data[0..8].copy_from_slice(&2u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        data[24..28].copy_from_slice(&char_count.to_le_bytes());
+        // Copy partial path data
+        data[28..28 + path_utf16.len()].copy_from_slice(&path_utf16);
+
+        // Should still parse what's available (truncated path recovery)
+        let entry = parse_i_file(&data, "test").unwrap();
+        assert_eq!(entry.original_path, path_str);
+    }
+
+    #[test]
+    fn test_parse_i_file_v2_too_short_for_path_data() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+        let mut data = vec![0u8; 30]; // Only 2 bytes of path data (< 4)
+        data[0..8].copy_from_slice(&2u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        data[24..28].copy_from_slice(&100u32.to_le_bytes()); // large path length
+        // Only 2 bytes available at offset 28 (< 4 required)
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_i_file_v1_empty_path() {
+        use chrono::TimeZone;
+        let deletion_time = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+        // Version 1 with all zeroes in the path region (null terminator immediately)
+        let mut data = vec![0u8; 24 + 520];
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        data[8..16].copy_from_slice(&100u64.to_le_bytes());
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        // Path area is all zeroes => empty path => error
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_next_recyclebin_id_increments() {
+        let id1 = next_recyclebin_id();
+        let id2 = next_recyclebin_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x5242);
+    }
+
+    #[test]
+    fn test_parse_i_file_min_size_boundary() {
+        // Exactly MIN_I_FILE_SIZE = 28 bytes
+        let mut data = vec![0u8; 28];
+        data[0..8].copy_from_slice(&99u64.to_le_bytes()); // invalid version
+        assert!(parse_i_file(&data, "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_i_file_27_bytes() {
+        // One byte below MIN_I_FILE_SIZE
+        let data = vec![0u8; 27];
+        let err = parse_i_file(&data, "test").unwrap_err();
+        assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_recycle_bin_entry_debug_clone() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = RecycleBinEntry {
+            original_path: "test".to_string(),
+            file_size: 42,
+            deletion_time: dt,
+            i_file_path: "i_file".to_string(),
+            version: 2,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.original_path, entry.original_path);
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("test"));
+    }
 }

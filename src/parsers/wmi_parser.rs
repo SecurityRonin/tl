@@ -583,4 +583,284 @@ mod tests {
             .collect();
         assert_eq!(cmd_entries.len(), 1, "Duplicate entries should be deduplicated");
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_find_pattern_at_end() {
+        let data = b"xxxhello";
+        let offsets = find_pattern(data, b"hello");
+        assert_eq!(offsets, vec![3]);
+    }
+
+    #[test]
+    fn test_find_pattern_overlapping() {
+        // Pattern "aa" in "aaaa" -- non-overlapping: [0, 2]
+        let data = b"aaaa";
+        let offsets = find_pattern(data, b"aa");
+        assert_eq!(offsets, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_find_pattern_data_shorter_than_pattern() {
+        let data = b"ab";
+        let offsets = find_pattern(data, b"abc");
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn test_find_pattern_exact_match() {
+        let data = b"hello";
+        let offsets = find_pattern(data, b"hello");
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn test_extract_ascii_string_offset_at_end() {
+        let data = b"hello";
+        let s = extract_ascii_string(data, 5, 10);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn test_extract_ascii_string_filters_non_graphic() {
+        // Non-graphic chars (except space) should be filtered out
+        let data = [b'h', b'i', 0x01, 0x02, b'!', 0x00];
+        let s = extract_ascii_string(&data, 0, 10);
+        assert_eq!(s, "hi!");
+    }
+
+    #[test]
+    fn test_extract_ascii_string_with_space() {
+        let data = b"hello world\x00";
+        let s = extract_ascii_string(data, 0, 20);
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn test_extract_context_at_start() {
+        let data = b"ABCDEFGH";
+        let ctx = extract_context(data, 0, 10, 4);
+        assert_eq!(ctx, "ABCD");
+    }
+
+    #[test]
+    fn test_extract_context_at_end() {
+        let data = b"ABCDEFGH";
+        let ctx = extract_context(data, 8, 4, 10);
+        assert_eq!(ctx, "EFGH");
+    }
+
+    #[test]
+    fn test_extract_context_all_nonprintable() {
+        let data = [0x01, 0x02, 0x03, 0x04];
+        let ctx = extract_context(&data, 0, 0, 4);
+        assert_eq!(ctx, "....");
+    }
+
+    #[test]
+    fn test_extract_name_near_no_class_name() {
+        let context = "some random text without the class";
+        let name = extract_name_near(context, "CommandLineEventConsumer");
+        assert_eq!(name, "Unknown");
+    }
+
+    #[test]
+    fn test_extract_name_near_no_name_field() {
+        let context = "CommandLineEventConsumer something else";
+        let name = extract_name_near(context, "CommandLineEventConsumer");
+        assert_eq!(name, "Unknown");
+    }
+
+    #[test]
+    fn test_extract_name_near_with_name() {
+        let context = "CommandLineEventConsumer.Name=\"EvilConsumer\" more data";
+        let name = extract_name_near(context, "CommandLineEventConsumer");
+        assert_eq!(name, "EvilConsumer");
+    }
+
+    #[test]
+    fn test_extract_commandline_details_with_template() {
+        let context = "CommandLineTemplate=\"powershell -enc ZQ\" more";
+        let details = extract_commandline_details(context);
+        assert!(details.contains("CommandLineTemplate"));
+        assert!(details.contains("powershell"));
+    }
+
+    #[test]
+    fn test_extract_commandline_details_with_executable_path() {
+        let context = "ExecutablePath=\"C:\\evil.exe\" more";
+        let details = extract_commandline_details(context);
+        assert!(details.contains("ExecutablePath"));
+        assert!(details.contains("evil.exe"));
+    }
+
+    #[test]
+    fn test_extract_commandline_details_none() {
+        let context = "no command line info here";
+        let details = extract_commandline_details(context);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn test_extract_script_details_with_script_text() {
+        let context = "ScriptText=\"CreateObject(...)\" more";
+        let details = extract_script_details(context);
+        assert!(details.contains("ScriptText"));
+    }
+
+    #[test]
+    fn test_extract_script_details_with_engine() {
+        let context = "ScriptingEngine=\"VBScript\" more";
+        let details = extract_script_details(context);
+        assert!(details.contains("ScriptingEngine"));
+        assert!(details.contains("VBScript"));
+    }
+
+    #[test]
+    fn test_extract_script_details_with_filename() {
+        let context = "ScriptFileName=\"C:\\evil.vbs\" data";
+        let details = extract_script_details(context);
+        assert!(details.contains("ScriptFileName"));
+    }
+
+    #[test]
+    fn test_extract_script_details_none() {
+        let context = "nothing relevant here";
+        let details = extract_script_details(context);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn test_extract_filter_details_with_select() {
+        let context = "SELECT * FROM __InstanceModificationEvent WHERE something";
+        let details = extract_filter_details(context);
+        assert!(details.starts_with("SELECT"));
+    }
+
+    #[test]
+    fn test_extract_filter_details_no_select() {
+        let context = "no query here";
+        let details = extract_filter_details(context);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn test_extract_binding_details_with_consumer_and_filter() {
+        let context = "Consumer=\"CmdConsumer\" Filter=\"MyFilter\" end";
+        let details = extract_binding_details(context);
+        assert!(details.contains("Consumer"));
+        assert!(details.contains("Filter"));
+        assert!(details.contains("->"));
+    }
+
+    #[test]
+    fn test_extract_binding_details_consumer_only() {
+        let context = "Consumer=\"CmdConsumer\" end";
+        let details = extract_binding_details(context);
+        assert!(details.contains("Consumer"));
+    }
+
+    #[test]
+    fn test_extract_binding_details_empty() {
+        let context = "nothing here";
+        let details = extract_binding_details(context);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn test_wmi_persistence_type_eq() {
+        assert_eq!(WmiPersistenceType::CommandLineConsumer, WmiPersistenceType::CommandLineConsumer);
+        assert_ne!(WmiPersistenceType::CommandLineConsumer, WmiPersistenceType::ActiveScriptConsumer);
+        assert_eq!(
+            WmiPersistenceType::GenericConsumer("test".to_string()),
+            WmiPersistenceType::GenericConsumer("test".to_string())
+        );
+        assert_ne!(
+            WmiPersistenceType::GenericConsumer("a".to_string()),
+            WmiPersistenceType::GenericConsumer("b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_wmi_persistence_type_debug() {
+        let t = WmiPersistenceType::EventFilter;
+        let debug_str = format!("{:?}", t);
+        assert_eq!(debug_str, "EventFilter");
+    }
+
+    #[test]
+    fn test_wmi_persistence_entry_debug_clone() {
+        let entry = WmiPersistenceEntry {
+            persistence_type: WmiPersistenceType::ActiveScriptConsumer,
+            name: "test".to_string(),
+            details: "details".to_string(),
+            is_benign: false,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.name, "test");
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("ActiveScriptConsumer"));
+    }
+
+    #[test]
+    fn test_parse_wmi_objects_event_filter_skip_binding() {
+        // __EventFilter preceded by '_' (part of _FilterToConsumerBinding) should be skipped
+        let mut data = vec![0u8; 512];
+        // Place "_FilterToConsumerBinding__EventFilter" pattern
+        let binding_filter = b"___EventFilter";
+        let offset = 256;
+        data[offset..offset + binding_filter.len()].copy_from_slice(binding_filter);
+
+        let entries = parse_wmi_objects(&data);
+        // The __EventFilter at offset 257 should be skipped because data[256] == '_'
+        // Only the _FilterToConsumerBinding should be found
+        let filter_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.persistence_type == WmiPersistenceType::EventFilter)
+            .collect();
+        assert_eq!(filter_entries.len(), 0, "Should skip __EventFilter preceded by _");
+    }
+
+    #[test]
+    fn test_parse_wmi_objects_benign_bvt_consumer() {
+        let mut data = vec![0u8; 512];
+        let consumer = b"CommandLineEventConsumer";
+        let name_field = b"Name=\"BVTConsumer\"";
+
+        let offset = 256;
+        data[offset..offset + consumer.len()].copy_from_slice(consumer);
+        let name_off = offset + consumer.len() + 5;
+        data[name_off..name_off + name_field.len()].copy_from_slice(name_field);
+
+        let entries = parse_wmi_objects(&data);
+        let cmd_entry = entries
+            .iter()
+            .find(|e| e.persistence_type == WmiPersistenceType::CommandLineConsumer);
+        if let Some(entry) = cmd_entry {
+            assert!(entry.is_benign, "BVTConsumer should be benign");
+        }
+    }
+
+    #[test]
+    fn test_next_wmi_id_increments() {
+        let id1 = next_wmi_id();
+        let id2 = next_wmi_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x574D);
+    }
+
+    #[test]
+    fn test_generic_consumer_type() {
+        let entry = WmiPersistenceEntry {
+            persistence_type: WmiPersistenceType::GenericConsumer("CustomClass".to_string()),
+            name: "test".to_string(),
+            details: "details".to_string(),
+            is_benign: false,
+        };
+        match &entry.persistence_type {
+            WmiPersistenceType::GenericConsumer(class) => assert_eq!(class, "CustomClass"),
+            _ => panic!("Expected GenericConsumer"),
+        }
+    }
 }

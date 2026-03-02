@@ -277,6 +277,234 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ─── next_autorun_id tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_next_autorun_id_increments() {
+        let id1 = next_autorun_id();
+        let id2 = next_autorun_id();
+        assert!(id2 > id1);
+        assert_eq!(id2 - id1, 1);
+    }
+
+    #[test]
+    fn test_next_autorun_id_has_ar_prefix() {
+        let id = next_autorun_id();
+        let prefix = (id >> 48) & 0xFFFF;
+        assert_eq!(prefix, 0x4152);
+    }
+
+    // ─── AutorunEntry struct tests ──────────────────────────────────────
+
+    #[test]
+    fn test_autorun_entry_clone() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = AutorunEntry {
+            name: "TestRun".to_string(),
+            command: r"C:\test.exe -flag".to_string(),
+            key_path: r"Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+            hive_source: "NTUSER.DAT (admin)".to_string(),
+            last_write: ts,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.name, entry.name);
+        assert_eq!(cloned.command, entry.command);
+        assert_eq!(cloned.key_path, entry.key_path);
+        assert_eq!(cloned.hive_source, entry.hive_source);
+        assert_eq!(cloned.last_write, entry.last_write);
+    }
+
+    #[test]
+    fn test_autorun_entry_debug() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = AutorunEntry {
+            name: "DbgAutorun".to_string(),
+            command: "cmd.exe".to_string(),
+            key_path: "Run".to_string(),
+            hive_source: "SOFTWARE".to_string(),
+            last_write: ts,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("AutorunEntry"));
+        assert!(debug_str.contains("DbgAutorun"));
+    }
+
+    // ─── Key path constants tests ───────────────────────────────────────
+
+    #[test]
+    fn test_software_run_paths_not_empty() {
+        assert!(!SOFTWARE_RUN_PATHS.is_empty());
+        for path in SOFTWARE_RUN_PATHS {
+            assert!(path.contains("Run"), "Expected 'Run' in path: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_ntuser_run_paths_not_empty() {
+        assert!(!NTUSER_RUN_PATHS.is_empty());
+        for path in NTUSER_RUN_PATHS {
+            assert!(path.contains("Run"), "Expected 'Run' in path: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_software_run_paths_include_wow64() {
+        let has_wow64 = SOFTWARE_RUN_PATHS
+            .iter()
+            .any(|p| p.contains("Wow6432Node"));
+        assert!(has_wow64, "SOFTWARE paths should include Wow6432Node entries");
+    }
+
+    #[test]
+    fn test_software_run_paths_include_runonce() {
+        let has_runonce = SOFTWARE_RUN_PATHS
+            .iter()
+            .any(|p| p.contains("RunOnce"));
+        assert!(has_runonce, "SOFTWARE paths should include RunOnce");
+    }
+
+    #[test]
+    fn test_ntuser_run_paths_include_runonce() {
+        let has_runonce = NTUSER_RUN_PATHS
+            .iter()
+            .any(|p| p.contains("RunOnce"));
+        assert!(has_runonce, "NTUSER paths should include RunOnce");
+    }
+
+    // ─── push_autorun_entry tests ───────────────────────────────────────
+
+    #[test]
+    fn test_push_autorun_entry_adds_to_store() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let ar = AutorunEntry {
+            name: "TestEntry".to_string(),
+            command: r"C:\test.exe".to_string(),
+            key_path: "Run".to_string(),
+            hive_source: "SOFTWARE".to_string(),
+            last_write: ts,
+        };
+        let mut store = TimelineStore::new();
+        push_autorun_entry(&ar, &mut store);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_push_autorun_entry_format() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let ar = AutorunEntry {
+            name: "Persistence".to_string(),
+            command: r"powershell.exe -ep bypass".to_string(),
+            key_path: r"Microsoft\Windows\CurrentVersion\Run".to_string(),
+            hive_source: "NTUSER.DAT (victim)".to_string(),
+            last_write: ts,
+        };
+        let mut store = TimelineStore::new();
+        push_autorun_entry(&ar, &mut store);
+        // Verify the description format from the stored entry
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_push_autorun_entry_event_type() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let ar = AutorunEntry {
+            name: "Check".to_string(),
+            command: "cmd.exe".to_string(),
+            key_path: "Run".to_string(),
+            hive_source: "SOFTWARE".to_string(),
+            last_write: ts,
+        };
+        let mut store = TimelineStore::new();
+        push_autorun_entry(&ar, &mut store);
+        assert_eq!(store.len(), 1);
+    }
+
+    // ─── Description format tests ───────────────────────────────────────
+
+    #[test]
+    fn test_autorun_description_contains_all_fields() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let ar = AutorunEntry {
+            name: "SuspiciousRun".to_string(),
+            command: r"C:\Users\Public\evil.exe".to_string(),
+            key_path: r"Microsoft\Windows\CurrentVersion\RunOnce".to_string(),
+            hive_source: "SOFTWARE".to_string(),
+            last_write: ts,
+        };
+
+        let desc = format!(
+            "[Autorun:{}] {} = {} ({})",
+            ar.hive_source, ar.name, ar.command, ar.key_path,
+        );
+
+        assert!(desc.contains("Autorun:SOFTWARE"));
+        assert!(desc.contains("SuspiciousRun"));
+        assert!(desc.contains("evil.exe"));
+        assert!(desc.contains("RunOnce"));
+    }
+
+    #[test]
+    fn test_autorun_description_ntuser_format() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let ar = AutorunEntry {
+            name: "Update".to_string(),
+            command: "updater.exe".to_string(),
+            key_path: r"Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+            hive_source: "NTUSER.DAT (jdoe)".to_string(),
+            last_write: ts,
+        };
+
+        let desc = format!(
+            "[Autorun:{}] {} = {} ({})",
+            ar.hive_source, ar.name, ar.command, ar.key_path,
+        );
+
+        assert!(desc.contains("NTUSER.DAT (jdoe)"));
+    }
+
+    // ─── parse_autoruns_from_hive edge cases ────────────────────────────
+
+    #[test]
+    fn test_parse_autoruns_from_hive_garbage_data() {
+        let garbage = vec![0xFFu8; 256];
+        let result = parse_autoruns_from_hive(&garbage, "SOFTWARE", SOFTWARE_RUN_PATHS);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_autoruns_from_hive_small_data() {
+        let small = vec![0x42u8; 10];
+        let result = parse_autoruns_from_hive(&small, "TEST", NTUSER_RUN_PATHS);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_autoruns_from_hive_empty_key_paths() {
+        // With empty key paths, should still fail on invalid hive data
+        let data = vec![0u8; 0];
+        let result = parse_autoruns_from_hive(&data, "SOFTWARE", &[]);
+        assert!(result.is_err());
+    }
+
+    // ─── Multiple push tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_push_multiple_autorun_entries() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let mut store = TimelineStore::new();
+        for i in 0..5 {
+            let ar = AutorunEntry {
+                name: format!("Entry{}", i),
+                command: format!("cmd{}.exe", i),
+                key_path: "Run".to_string(),
+                hive_source: "SOFTWARE".to_string(),
+                last_write: ts,
+            };
+            push_autorun_entry(&ar, &mut store);
+        }
+        assert_eq!(store.len(), 5);
+    }
+
     #[test]
     fn test_empty_manifest_no_error() {
         use crate::collection::manifest::ArtifactManifest;

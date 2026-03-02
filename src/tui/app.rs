@@ -197,3 +197,419 @@ impl App {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::entry::*;
+    use chrono::{TimeZone, Utc};
+    use smallvec::smallvec;
+
+    /// Helper: create a TimelineEntry with a given path and year for sorting.
+    fn make_entry(path: &str, year: i32) -> TimelineEntry {
+        TimelineEntry {
+            entity_id: EntityId::Generated(0),
+            path: path.to_string(),
+            primary_timestamp: Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap(),
+            event_type: EventType::FileCreate,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Mft],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        }
+    }
+
+    /// Helper: build a TimelineStore with numbered paths.
+    fn make_store(count: usize) -> TimelineStore {
+        let mut store = TimelineStore::new();
+        for i in 0..count {
+            store.push(make_entry(&format!("file_{}", i), 2020 + (i as i32)));
+        }
+        store
+    }
+
+    /// Helper: build an App with a store of `count` entries and default visible_rows.
+    fn make_app(count: usize) -> App {
+        App::new(make_store(count), "TESTHOST".into(), "2025-01-01".into())
+    }
+
+    // ─── App::new ───────────────────────────────────────────
+
+    #[test]
+    fn new_creates_correct_initial_state() {
+        let app = make_app(5);
+        assert_eq!(app.selected_index, 0);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.detail_expanded);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_results.is_empty());
+        assert_eq!(app.search_cursor, 0);
+        assert!(!app.should_quit);
+        assert_eq!(app.visible_rows, 20);
+        assert_eq!(app.hostname, "TESTHOST");
+        assert_eq!(app.collection_date, "2025-01-01");
+        assert!(matches!(app.mode, AppMode::Normal));
+    }
+
+    // ─── move_down / move_up ────────────────────────────────
+
+    #[test]
+    fn move_down_increments_selected_index() {
+        let mut app = make_app(10);
+        app.move_down(1);
+        assert_eq!(app.selected_index, 1);
+        app.move_down(3);
+        assert_eq!(app.selected_index, 4);
+    }
+
+    #[test]
+    fn move_down_clamps_at_last_entry() {
+        let mut app = make_app(5);
+        app.move_down(100);
+        assert_eq!(app.selected_index, 4); // 5 entries, max index = 4
+    }
+
+    #[test]
+    fn move_up_decrements_selected_index() {
+        let mut app = make_app(10);
+        app.selected_index = 5;
+        app.move_up(2);
+        assert_eq!(app.selected_index, 3);
+    }
+
+    #[test]
+    fn move_up_clamps_at_zero() {
+        let mut app = make_app(10);
+        app.selected_index = 2;
+        app.move_up(100);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn move_down_on_empty_store_stays_at_zero() {
+        let mut app = make_app(0);
+        app.move_down(1);
+        // saturating_sub(1) on 0 = 0, min(0,0) = 0
+        assert_eq!(app.selected_index, 0);
+    }
+
+    // ─── page_down / page_up ────────────────────────────────
+
+    #[test]
+    fn page_down_moves_half_visible_rows() {
+        let mut app = make_app(50);
+        app.visible_rows = 20;
+        app.page_down();
+        assert_eq!(app.selected_index, 10); // 20/2 = 10
+    }
+
+    #[test]
+    fn page_up_moves_half_visible_rows() {
+        let mut app = make_app(50);
+        app.visible_rows = 20;
+        app.selected_index = 30;
+        app.scroll_offset = 20;
+        app.page_up();
+        assert_eq!(app.selected_index, 20);
+    }
+
+    #[test]
+    fn full_page_down_moves_full_visible_rows() {
+        let mut app = make_app(50);
+        app.visible_rows = 20;
+        app.full_page_down();
+        assert_eq!(app.selected_index, 20);
+    }
+
+    #[test]
+    fn full_page_up_moves_full_visible_rows() {
+        let mut app = make_app(50);
+        app.visible_rows = 20;
+        app.selected_index = 30;
+        app.scroll_offset = 20;
+        app.full_page_up();
+        assert_eq!(app.selected_index, 10);
+    }
+
+    // ─── goto_top / goto_bottom ─────────────────────────────
+
+    #[test]
+    fn goto_top_resets_to_zero() {
+        let mut app = make_app(10);
+        app.selected_index = 7;
+        app.scroll_offset = 3;
+        app.goto_top();
+        assert_eq!(app.selected_index, 0);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn goto_bottom_jumps_to_last_entry() {
+        let mut app = make_app(10);
+        app.goto_bottom();
+        assert_eq!(app.selected_index, 9);
+    }
+
+    // ─── toggle_detail ──────────────────────────────────────
+
+    #[test]
+    fn toggle_detail_flips_state() {
+        let mut app = make_app(5);
+        assert!(!app.detail_expanded);
+        app.toggle_detail();
+        assert!(app.detail_expanded);
+        app.toggle_detail();
+        assert!(!app.detail_expanded);
+    }
+
+    // ─── ensure_visible (scroll tracking) ───────────────────
+
+    #[test]
+    fn move_down_past_visible_rows_updates_scroll_offset() {
+        let mut app = make_app(30);
+        app.visible_rows = 5;
+        // Move to index 5 => should scroll so that index 5 is visible
+        app.move_down(5);
+        assert_eq!(app.selected_index, 5);
+        // scroll_offset should be 5 - 5 + 1 = 1
+        assert_eq!(app.scroll_offset, 1);
+    }
+
+    #[test]
+    fn move_up_before_scroll_offset_updates_scroll_offset() {
+        let mut app = make_app(30);
+        app.visible_rows = 5;
+        app.selected_index = 10;
+        app.scroll_offset = 10;
+        app.move_up(3);
+        assert_eq!(app.selected_index, 7);
+        assert_eq!(app.scroll_offset, 7);
+    }
+
+    // ─── selected_entry ─────────────────────────────────────
+
+    #[test]
+    fn selected_entry_returns_correct_entry() {
+        let app = make_app(3);
+        let entry = app.selected_entry().unwrap();
+        assert_eq!(entry.path, "file_0");
+    }
+
+    #[test]
+    fn selected_entry_returns_none_for_empty_store() {
+        let app = make_app(0);
+        assert!(app.selected_entry().is_none());
+    }
+
+    // ─── begin_search / cancel_search / confirm_search ──────
+
+    #[test]
+    fn begin_search_saves_position_and_clears_query() {
+        let mut app = make_app(10);
+        app.selected_index = 5;
+        app.scroll_offset = 2;
+        app.search_query = "old".to_string();
+        app.search_results = vec![1, 2, 3];
+        app.begin_search();
+
+        assert_eq!(app.pre_search_index, 5);
+        assert_eq!(app.pre_search_offset, 2);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_results.is_empty());
+        assert_eq!(app.search_cursor, 0);
+    }
+
+    #[test]
+    fn cancel_search_restores_position() {
+        let mut app = make_app(10);
+        app.selected_index = 3;
+        app.scroll_offset = 1;
+        app.begin_search();
+
+        // Simulate search moving position
+        app.selected_index = 8;
+        app.scroll_offset = 5;
+        app.search_query = "test".to_string();
+
+        app.cancel_search();
+        assert_eq!(app.selected_index, 3);
+        assert_eq!(app.scroll_offset, 1);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_results.is_empty());
+    }
+
+    #[test]
+    fn confirm_search_updates_status_when_results_exist() {
+        let mut app = make_app(5);
+        app.search_query = "file".to_string();
+        app.search_results = vec![0, 1, 2];
+        app.search_cursor = 1;
+        app.confirm_search();
+        assert!(app.status_message.contains("2/3"));
+    }
+
+    #[test]
+    fn confirm_search_does_nothing_when_no_results() {
+        let mut app = make_app(5);
+        app.search_results.clear();
+        app.status_message.clear();
+        app.confirm_search();
+        assert!(app.status_message.is_empty());
+    }
+
+    // ─── incremental_search ─────────────────────────────────
+
+    #[test]
+    fn incremental_search_finds_matches() {
+        let mut app = make_app(5);
+        app.begin_search();
+        app.search_query = "file_2".to_string();
+        app.incremental_search();
+
+        assert_eq!(app.search_results, vec![2]);
+        assert_eq!(app.selected_index, 2);
+        assert!(app.status_message.contains("1/1"));
+    }
+
+    #[test]
+    fn incremental_search_case_insensitive() {
+        let mut store = TimelineStore::new();
+        store.push(make_entry("Alpha.TXT", 2020));
+        store.push(make_entry("bravo.txt", 2021));
+        let mut app = App::new(store, "H".into(), "D".into());
+        app.begin_search();
+        app.search_query = "alpha".to_string();
+        app.incremental_search();
+        assert_eq!(app.search_results, vec![0]);
+    }
+
+    #[test]
+    fn incremental_search_no_matches_sets_status() {
+        let mut app = make_app(5);
+        app.begin_search();
+        app.search_query = "nonexistent".to_string();
+        app.incremental_search();
+
+        assert!(app.search_results.is_empty());
+        assert!(app.status_message.contains("No matches"));
+    }
+
+    #[test]
+    fn incremental_search_empty_query_restores_position() {
+        let mut app = make_app(5);
+        app.selected_index = 3;
+        app.scroll_offset = 1;
+        app.begin_search();
+        app.search_query.clear();
+        app.incremental_search();
+
+        assert_eq!(app.selected_index, 3);
+        assert_eq!(app.scroll_offset, 1);
+        assert!(app.status_message.is_empty());
+    }
+
+    #[test]
+    fn incremental_search_nearest_forward_match() {
+        // Entries: file_0..file_4. Start search from index 3.
+        let mut app = make_app(5);
+        app.selected_index = 3;
+        app.begin_search();
+        app.search_query = "file_".to_string();
+        app.incremental_search();
+
+        // Nearest match at or after pre_search_index=3 is index 3 itself
+        assert_eq!(app.selected_index, 3);
+        assert_eq!(app.search_cursor, 3);
+    }
+
+    #[test]
+    fn incremental_search_wraps_when_no_forward_match() {
+        // All entries match, but if pre_search_index is past last match, wraps to 0
+        let mut store = TimelineStore::new();
+        store.push(make_entry("alpha", 2020));
+        store.push(make_entry("bravo", 2021));
+        store.push(make_entry("charlie", 2022));
+        let mut app = App::new(store, "H".into(), "D".into());
+
+        app.selected_index = 2;
+        app.begin_search();
+        app.search_query = "alpha".to_string(); // only matches index 0
+        app.incremental_search();
+
+        // No match at or after index 2, so wraps to first match (index 0)
+        assert_eq!(app.selected_index, 0);
+        assert_eq!(app.search_cursor, 0);
+    }
+
+    // ─── next_match / prev_match ────────────────────────────
+
+    #[test]
+    fn next_match_cycles_forward() {
+        let mut app = make_app(5);
+        app.search_query = "file".to_string();
+        app.search_results = vec![0, 2, 4];
+        app.search_cursor = 0;
+
+        app.next_match();
+        assert_eq!(app.search_cursor, 1);
+        assert_eq!(app.selected_index, 2);
+
+        app.next_match();
+        assert_eq!(app.search_cursor, 2);
+        assert_eq!(app.selected_index, 4);
+
+        // Wraps around
+        app.next_match();
+        assert_eq!(app.search_cursor, 0);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn prev_match_cycles_backward() {
+        let mut app = make_app(5);
+        app.search_query = "file".to_string();
+        app.search_results = vec![0, 2, 4];
+        app.search_cursor = 0;
+
+        // Wraps to end
+        app.prev_match();
+        assert_eq!(app.search_cursor, 2);
+        assert_eq!(app.selected_index, 4);
+
+        app.prev_match();
+        assert_eq!(app.search_cursor, 1);
+        assert_eq!(app.selected_index, 2);
+    }
+
+    #[test]
+    fn next_match_does_nothing_when_no_results() {
+        let mut app = make_app(5);
+        app.search_results.clear();
+        app.selected_index = 2;
+        app.next_match();
+        assert_eq!(app.selected_index, 2); // unchanged
+    }
+
+    #[test]
+    fn prev_match_does_nothing_when_no_results() {
+        let mut app = make_app(5);
+        app.search_results.clear();
+        app.selected_index = 2;
+        app.prev_match();
+        assert_eq!(app.selected_index, 2); // unchanged
+    }
+
+    // ─── visible_rows ───────────────────────────────────────
+
+    #[test]
+    fn visible_rows_affects_page_navigation() {
+        let mut app = make_app(100);
+        app.visible_rows = 10;
+        app.page_down();
+        assert_eq!(app.selected_index, 5); // 10/2
+
+        app.visible_rows = 40;
+        app.page_down();
+        assert_eq!(app.selected_index, 25); // 5 + 40/2
+    }
+}

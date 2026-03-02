@@ -905,4 +905,336 @@ mod tests {
         let result = read_ascii_string(data, 0, 5);
         assert_eq!(result, "hello");
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_filetime_negative_secs() {
+        let filetime = 10_000_000u64;
+        assert!(filetime_to_datetime(filetime).is_none());
+    }
+
+    #[test]
+    fn test_read_u16_le_valid() {
+        let data = [0x34, 0x12, 0x00, 0x00];
+        assert_eq!(read_u16_le(&data, 0), Some(0x1234));
+    }
+
+    #[test]
+    fn test_read_u16_le_boundary() {
+        let data = [0x34, 0x12];
+        assert_eq!(read_u16_le(&data, 0), Some(0x1234));
+        assert!(read_u16_le(&data, 1).is_none());
+    }
+
+    #[test]
+    fn test_read_u32_le_boundary() {
+        let data = [0x01, 0x02, 0x03, 0x04];
+        assert_eq!(read_u32_le(&data, 0), Some(0x04030201));
+        assert!(read_u32_le(&data, 1).is_none());
+    }
+
+    #[test]
+    fn test_read_u64_le_boundary() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        assert_eq!(read_u64_le(&data, 0), Some(0x0807060504030201));
+        assert!(read_u64_le(&data, 1).is_none());
+    }
+
+    #[test]
+    fn test_decode_utf16le_with_null_terminator() {
+        let s = "test";
+        let mut encoded: Vec<u8> = s
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        encoded.extend_from_slice(&[0, 0]); // null terminator
+        // Should trim trailing nulls
+        assert_eq!(decode_utf16le(&encoded), "test");
+    }
+
+    #[test]
+    fn test_decode_utf16le_with_replacement_char() {
+        // Invalid surrogate pair
+        let data: Vec<u8> = vec![0x00, 0xD8, 0x41, 0x00]; // lone high surrogate + 'A'
+        let result = decode_utf16le(&data);
+        assert!(result.contains('\u{FFFD}')); // replacement character
+        assert!(result.contains('A'));
+    }
+
+    #[test]
+    fn test_decode_utf16le_empty() {
+        let data: Vec<u8> = vec![];
+        assert_eq!(decode_utf16le(&data), "");
+    }
+
+    #[test]
+    fn test_read_ascii_string_with_offset() {
+        let data = b"XXhello world\0more";
+        let result = read_ascii_string(data, 2, 20);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_read_ascii_string_max_len_limits() {
+        let data = b"abcdefghij";
+        let result = read_ascii_string(data, 0, 3);
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn test_format_mac_all_zeros() {
+        assert_eq!(
+            format_mac_address(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            "00:00:00:00:00:00"
+        );
+    }
+
+    #[test]
+    fn test_tracker_data_eq() {
+        let t1 = TrackerData {
+            machine_id: "PC1".to_string(),
+            mac_address: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        };
+        let t2 = TrackerData {
+            machine_id: "PC1".to_string(),
+            mac_address: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        };
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_tracker_data_ne() {
+        let t1 = TrackerData {
+            machine_id: "PC1".to_string(),
+            mac_address: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        };
+        let t2 = TrackerData {
+            machine_id: "PC2".to_string(),
+            mac_address: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        };
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn test_parse_lnk_with_id_list() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        // Header with HAS_LINK_TARGET_ID_LIST
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            HAS_LINK_TARGET_ID_LIST,
+        );
+
+        // IDList: 2-byte size = 4, then 4 bytes of data
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&[0u8; 4]);
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert!(info.target_path.is_none());
+        assert_eq!(info.target_created, Some(dt));
+    }
+
+    #[test]
+    fn test_parse_lnk_with_string_data_unicode() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        // Header with HAS_RELATIVE_PATH and IS_UNICODE
+        let flags = HAS_RELATIVE_PATH | IS_UNICODE;
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            flags,
+        );
+
+        // Relative path string (Unicode): count=4, "test" in UTF-16LE
+        let rel_path = "test";
+        let count = rel_path.encode_utf16().count() as u16;
+        data.extend_from_slice(&count.to_le_bytes());
+        let utf16: Vec<u8> = rel_path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16);
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert_eq!(info.target_path, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_parse_lnk_with_string_data_ascii() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        // Header with HAS_RELATIVE_PATH (no IS_UNICODE)
+        let flags = HAS_RELATIVE_PATH;
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            flags,
+        );
+
+        // Relative path string (ASCII): count=4, "test"
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(b"test");
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert_eq!(info.target_path, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_parse_lnk_skip_working_dir_args_icon() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        // Header with HAS_WORKING_DIR | HAS_ARGUMENTS | HAS_ICON_LOCATION
+        let flags = HAS_WORKING_DIR | HAS_ARGUMENTS | HAS_ICON_LOCATION;
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            flags,
+        );
+
+        // Working dir: count=3, "abc"
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.extend_from_slice(b"abc");
+        // Arguments: count=2, "xy"
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(b"xy");
+        // Icon: count=1, "z"
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(b"z");
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert!(info.target_path.is_none());
+        assert!(info.tracker_data.is_none());
+    }
+
+    #[test]
+    fn test_parse_lnk_with_name_string() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        // Header with HAS_NAME
+        let flags = HAS_NAME;
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            flags,
+        );
+
+        // Name string: count=5, "hello"
+        data.extend_from_slice(&5u16.to_le_bytes());
+        data.extend_from_slice(b"hello");
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        // NAME_STRING is skipped, not used
+        assert!(info.target_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_lnk_extra_data_non_tracker() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            0,
+        );
+
+        // Add a non-tracker extra data block (random signature)
+        let block_size = 20u32;
+        data.extend_from_slice(&block_size.to_le_bytes());
+        data.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 12]); // pad to 20 bytes
+
+        // Terminal block
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert!(info.tracker_data.is_none());
+    }
+
+    #[test]
+    fn test_parse_lnk_no_timestamps() {
+        // Header with all zero timestamps
+        let data = build_lnk_header(0, 0, 0, 100, 0);
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert!(info.target_created.is_none());
+        assert!(info.target_modified.is_none());
+        assert!(info.target_accessed.is_none());
+    }
+
+    #[test]
+    fn test_next_lnk_id_increments() {
+        let id1 = next_lnk_id();
+        let id2 = next_lnk_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x4C4E);
+    }
+
+    #[test]
+    fn test_lnk_info_debug_clone() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let info = LnkInfo {
+            target_path: Some("test.txt".to_string()),
+            target_created: Some(dt),
+            target_modified: Some(dt),
+            target_accessed: Some(dt),
+            volume_serial: Some(0x1234),
+            drive_type: Some(3),
+            target_file_size: 42,
+            lnk_path: "test.lnk".to_string(),
+            tracker_data: None,
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.target_path, info.target_path);
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("test.txt"));
+    }
+
+    #[test]
+    fn test_parse_lnk_link_info_no_volume_id() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        let mut data = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            HAS_LINK_INFO,
+        );
+
+        // LinkInfo with flags = 0 (no VolumeIDAndLocalBasePath)
+        let link_info_size = 28u32;
+        data.extend_from_slice(&link_info_size.to_le_bytes());
+        data.extend_from_slice(&28u32.to_le_bytes()); // header size
+        data.extend_from_slice(&0x00u32.to_le_bytes()); // flags = 0
+        data.extend_from_slice(&0u32.to_le_bytes());    // VolumeIDOffset
+        data.extend_from_slice(&0u32.to_le_bytes());    // LocalBasePathOffset
+        data.extend_from_slice(&0u32.to_le_bytes());    // CommonNetworkRelativeLinkOffset
+        data.extend_from_slice(&0u32.to_le_bytes());    // CommonPathSuffixOffset
+
+        let info = parse_lnk_data(&data, "test.lnk").unwrap();
+        assert!(info.target_path.is_none());
+        assert!(info.volume_serial.is_none());
+    }
 }

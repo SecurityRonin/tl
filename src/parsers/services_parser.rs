@@ -317,6 +317,211 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ─── start_type_str comprehensive tests ─────────────────────────────
+
+    #[test]
+    fn test_start_type_system() {
+        assert_eq!(start_type_str(1), "System");
+    }
+
+    #[test]
+    fn test_start_type_manual() {
+        assert_eq!(start_type_str(3), "Manual");
+    }
+
+    #[test]
+    fn test_start_type_all_values() {
+        let expected = vec![
+            (0, "Boot"),
+            (1, "System"),
+            (2, "Auto"),
+            (3, "Manual"),
+            (4, "Disabled"),
+        ];
+        for (val, name) in expected {
+            assert_eq!(start_type_str(val), name, "Failed for start_type={}", val);
+        }
+    }
+
+    #[test]
+    fn test_start_type_large_unknown() {
+        assert_eq!(start_type_str(255), "Unknown");
+        assert_eq!(start_type_str(u32::MAX), "Unknown");
+    }
+
+    // ─── next_service_id tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_next_service_id_increments() {
+        let id1 = next_service_id();
+        let id2 = next_service_id();
+        assert!(id2 > id1);
+        assert_eq!(id2 - id1, 1);
+    }
+
+    #[test]
+    fn test_next_service_id_has_sv_prefix() {
+        let id = next_service_id();
+        let prefix = (id >> 48) & 0xFFFF;
+        assert_eq!(prefix, 0x5356);
+    }
+
+    // ─── ServiceEntry struct tests ──────────────────────────────────────
+
+    #[test]
+    fn test_service_entry_clone() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = ServiceEntry {
+            name: "TestSvc".to_string(),
+            image_path: r"C:\Windows\svc.exe".to_string(),
+            start_type: 2,
+            service_type: 16,
+            last_write: ts,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.name, entry.name);
+        assert_eq!(cloned.image_path, entry.image_path);
+        assert_eq!(cloned.start_type, entry.start_type);
+        assert_eq!(cloned.service_type, entry.service_type);
+        assert_eq!(cloned.last_write, entry.last_write);
+    }
+
+    #[test]
+    fn test_service_entry_debug() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = ServiceEntry {
+            name: "DebugSvc".to_string(),
+            image_path: r"C:\dbg.exe".to_string(),
+            start_type: 0,
+            service_type: 1,
+            last_write: ts,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("ServiceEntry"));
+        assert!(debug_str.contains("DebugSvc"));
+    }
+
+    // ─── ServiceEntry with various start types ──────────────────────────
+
+    #[test]
+    fn test_service_entry_boot_type() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let svc = ServiceEntry {
+            name: "BootDriver".to_string(),
+            image_path: r"system32\drivers\boot.sys".to_string(),
+            start_type: 0,
+            service_type: 1,
+            last_write: ts,
+        };
+        assert_eq!(start_type_str(svc.start_type), "Boot");
+    }
+
+    #[test]
+    fn test_service_entry_system_type() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let svc = ServiceEntry {
+            name: "SysDriver".to_string(),
+            image_path: r"system32\drivers\sys.sys".to_string(),
+            start_type: 1,
+            service_type: 2,
+            last_write: ts,
+        };
+        assert_eq!(start_type_str(svc.start_type), "System");
+    }
+
+    // ─── Description formatting tests ───────────────────────────────────
+
+    #[test]
+    fn test_service_description_format() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let svc = ServiceEntry {
+            name: "MySvc".to_string(),
+            image_path: r"C:\svc.exe".to_string(),
+            start_type: 2,
+            service_type: 16,
+            last_write: ts,
+        };
+        let desc = format!(
+            "[Service:{}] {} -> {}",
+            svc.name,
+            start_type_str(svc.start_type),
+            svc.image_path,
+        );
+        assert!(desc.starts_with("[Service:MySvc]"));
+        assert!(desc.contains("Auto"));
+        assert!(desc.contains(r"C:\svc.exe"));
+    }
+
+    #[test]
+    fn test_service_description_with_boot_start() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let svc = ServiceEntry {
+            name: "EarlyBoot".to_string(),
+            image_path: r"system32\drivers\early.sys".to_string(),
+            start_type: 0,
+            service_type: 1,
+            last_write: ts,
+        };
+        let desc = format!(
+            "[Service:{}] {} -> {}",
+            svc.name,
+            start_type_str(svc.start_type),
+            svc.image_path,
+        );
+        assert!(desc.contains("Boot"));
+    }
+
+    // ─── parse_services_from_hive edge cases ────────────────────────────
+
+    #[test]
+    fn test_parse_services_from_hive_garbage_data() {
+        let garbage = vec![0xFFu8; 256];
+        let result = parse_services_from_hive(&garbage);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_small_data() {
+        let small = vec![0x42u8; 10];
+        let result = parse_services_from_hive(&small);
+        assert!(result.is_err());
+    }
+
+    // ─── Timeline entry creation ────────────────────────────────────────
+
+    #[test]
+    fn test_service_timeline_entry_event_type() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_service_id()),
+            path: "[Service:Test] Auto -> test.exe".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::ServiceInstall,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Registry("SYSTEM".to_string())],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert_eq!(entry.event_type, EventType::ServiceInstall);
+        assert_eq!(format!("{}", entry.event_type), "SVC");
+    }
+
+    #[test]
+    fn test_service_timeline_entry_source() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_service_id()),
+            path: "[Service:X] Boot -> driver.sys".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::ServiceInstall,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Registry("SYSTEM".to_string())],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert_eq!(entry.sources[0], ArtifactSource::Registry("SYSTEM".to_string()));
+    }
+
     #[test]
     fn test_empty_manifest_no_error() {
         use crate::collection::manifest::ArtifactManifest;

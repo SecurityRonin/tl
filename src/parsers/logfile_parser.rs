@@ -475,4 +475,175 @@ mod tests {
         let summary = parse_logfile(&data).unwrap();
         assert_eq!(summary.highest_lsn, 200);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_filetime_before_unix_epoch() {
+        // secs < EPOCH_DIFF => None
+        let filetime = 100u64; // very small
+        assert!(filetime_to_datetime(filetime).is_none());
+    }
+
+    #[test]
+    fn test_filetime_with_nanos() {
+        // Ensure subsecond precision is preserved
+        let ft = 133_813_872_000_000_000u64 + 5_000_000; // 0.5 sec extra
+        let dt = filetime_to_datetime(ft).unwrap();
+        assert!(dt.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn test_read_u16_empty() {
+        let data: [u8; 0] = [];
+        assert!(read_u16(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_u16_exact() {
+        let data = [0xAB, 0xCD];
+        assert_eq!(read_u16(&data, 0), Some(0xCDAB));
+    }
+
+    #[test]
+    fn test_read_u32_empty() {
+        let data: [u8; 0] = [];
+        assert!(read_u32(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_u64_empty() {
+        let data: [u8; 0] = [];
+        assert!(read_u64(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_restart_area_bad_restart_offset() {
+        // Restart offset pointing past the page
+        let mut data = vec![0u8; LOG_PAGE_SIZE * 2];
+        data[0..4].copy_from_slice(RSTR_SIGNATURE);
+        data[0x10..0x14].copy_from_slice(&4096u32.to_le_bytes());
+        data[0x14..0x18].copy_from_slice(&4096u32.to_le_bytes());
+        // restart_offset = 0xFFF0 (way past page boundary)
+        data[0x18..0x1A].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        assert!(parse_restart_area(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_restart_area_second_page() {
+        let data = build_test_logfile(100, 200, 1, 0);
+        let ra = parse_restart_area(&data, LOG_PAGE_SIZE).unwrap();
+        assert_eq!(ra.current_lsn, 200);
+        assert_eq!(ra.offset, LOG_PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_analyze_record_pages_no_pages() {
+        // Data with only 2 restart pages, no RCRD pages
+        let data = build_test_logfile(100, 200, 1, 0);
+        let (count, gaps) = analyze_record_pages(&data);
+        assert_eq!(count, 0);
+        assert!(!gaps);
+    }
+
+    #[test]
+    fn test_analyze_record_pages_non_zero_non_rcrd() {
+        // A page that is non-zero and non-RCRD = corruption indicator
+        let mut data = build_test_logfile(100, 200, 1, 3);
+        let corrupt_offset = 3 * LOG_PAGE_SIZE;
+        data[corrupt_offset..corrupt_offset + 4].copy_from_slice(b"BAAD");
+        let (count, gaps) = analyze_record_pages(&data);
+        // Only 2 RCRD pages remain valid (page 2 and page 4)
+        assert_eq!(count, 2);
+        assert!(gaps);
+    }
+
+    #[test]
+    fn test_analyze_record_pages_zeroed_at_end() {
+        // Zeroed page at the very end (no RCRD after it => no gap flagged)
+        let mut data = build_test_logfile(100, 200, 1, 3);
+        let last_offset = 4 * LOG_PAGE_SIZE;
+        for b in &mut data[last_offset..last_offset + LOG_PAGE_SIZE] {
+            *b = 0;
+        }
+        let (count, gaps) = analyze_record_pages(&data);
+        assert_eq!(count, 2); // 2 RCRD pages remain
+        assert!(!gaps); // No RCRD after the zeroed page
+    }
+
+    #[test]
+    fn test_parse_logfile_one_restart_area() {
+        // Only first restart area is valid
+        let mut data = build_test_logfile(100, 200, 1, 5);
+        // Corrupt the second restart area signature
+        data[LOG_PAGE_SIZE..LOG_PAGE_SIZE + 4].copy_from_slice(b"BAAD");
+        let summary = parse_logfile(&data).unwrap();
+        assert_eq!(summary.restart_areas.len(), 1);
+        assert_eq!(summary.highest_lsn, 100);
+    }
+
+    #[test]
+    fn test_parse_logfile_second_restart_only() {
+        // Only second restart area is valid
+        let mut data = build_test_logfile(100, 200, 1, 5);
+        // Corrupt the first restart area signature
+        data[0..4].copy_from_slice(b"BAAD");
+        let summary = parse_logfile(&data).unwrap();
+        assert_eq!(summary.restart_areas.len(), 1);
+        assert_eq!(summary.highest_lsn, 200);
+    }
+
+    #[test]
+    fn test_restart_area_fields() {
+        let data = build_test_logfile(42, 43, 3, 0);
+        let ra = parse_restart_area(&data, 0).unwrap();
+        assert_eq!(ra.current_lsn, 42);
+        assert_eq!(ra.log_clients, 3);
+        assert_eq!(ra.system_page_size, 4096);
+        assert_eq!(ra.log_page_size, 4096);
+        assert_eq!(ra.offset, 0);
+    }
+
+    #[test]
+    fn test_logfile_summary_debug_clone() {
+        let data = build_test_logfile(100, 200, 1, 5);
+        let summary = parse_logfile(&data).unwrap();
+        let cloned = summary.clone();
+        assert_eq!(cloned.highest_lsn, summary.highest_lsn);
+        let debug_str = format!("{:?}", summary);
+        assert!(debug_str.contains("restart_areas"));
+    }
+
+    #[test]
+    fn test_restart_area_debug_clone() {
+        let ra = RestartArea {
+            offset: 0,
+            current_lsn: 42,
+            log_clients: 1,
+            system_page_size: 4096,
+            log_page_size: 4096,
+        };
+        let cloned = ra.clone();
+        assert_eq!(cloned.current_lsn, 42);
+        let debug_str = format!("{:?}", ra);
+        assert!(debug_str.contains("42"));
+    }
+
+    #[test]
+    fn test_next_logfile_id_increments() {
+        let id1 = next_logfile_id();
+        let id2 = next_logfile_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x4C46);
+    }
+
+    #[test]
+    fn test_parse_logfile_exactly_two_pages() {
+        // Minimum viable size: exactly 2 pages, both valid restart areas
+        let data = build_test_logfile(10, 20, 1, 0);
+        assert_eq!(data.len(), 2 * LOG_PAGE_SIZE);
+        let summary = parse_logfile(&data).unwrap();
+        assert_eq!(summary.restart_areas.len(), 2);
+        assert_eq!(summary.record_page_count, 0);
+    }
 }

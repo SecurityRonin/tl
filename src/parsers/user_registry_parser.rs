@@ -507,4 +507,261 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_decode_utf16le_empty() {
+        let data: &[u8] = &[];
+        assert_eq!(decode_utf16le(data), "");
+    }
+
+    #[test]
+    fn test_decode_utf16le_single_null() {
+        let data = b"\x00\x00";
+        assert_eq!(decode_utf16le(data), "");
+    }
+
+    #[test]
+    fn test_decode_utf16le_odd_byte_count() {
+        // Odd number of bytes - the last byte is ignored by chunks_exact
+        let data = b"h\x00e\x00l\x00l\x00o\x00\x00\x00X";
+        assert_eq!(decode_utf16le(data), "hello");
+    }
+
+    #[test]
+    fn test_decode_utf16le_with_embedded_null() {
+        // Should stop at the first null
+        let data = b"A\x00B\x00\x00\x00C\x00D\x00";
+        assert_eq!(decode_utf16le(data), "AB");
+    }
+
+    #[test]
+    fn test_decode_utf16le_unicode_chars() {
+        // Unicode snowman: U+2603 => 0x03, 0x26 in LE
+        let data = [0x03, 0x26, 0x00, 0x00];
+        let result = decode_utf16le(&data);
+        assert_eq!(result, "\u{2603}");
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_utf16_with_null() {
+        let data = b"f\x00i\x00l\x00e\x00.\x00t\x00x\x00t\x00\x00\x00\xFF\xFF\xFF\xFF";
+        assert_eq!(extract_filename_from_binary(data), "file.txt");
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_falls_back_to_ascii() {
+        // Data starts with null (empty UTF-16), so falls back to ASCII
+        let data = b"\x00\x00\x00\x00hello.txt";
+        let result = extract_filename_from_binary(data);
+        assert!(result.contains("hello.txt"));
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_3_bytes() {
+        // Less than 4 bytes returns empty
+        assert_eq!(extract_filename_from_binary(&[0x41, 0x00, 0x42]), "");
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_all_nulls() {
+        // All null bytes - UTF-16 decode returns empty, ASCII fallback also empty
+        let data = vec![0u8; 16];
+        assert_eq!(extract_filename_from_binary(&data), "");
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_exactly_4_bytes() {
+        let data = b"A\x00B\x00"; // "AB" in UTF-16LE
+        assert_eq!(extract_filename_from_binary(data), "AB");
+    }
+
+    #[test]
+    fn test_user_reg_activity_type_equality() {
+        assert_eq!(UserRegActivityType::TypedPath, UserRegActivityType::TypedPath);
+        assert_eq!(UserRegActivityType::SearchQuery, UserRegActivityType::SearchQuery);
+        assert_eq!(UserRegActivityType::OpenSaveDialog, UserRegActivityType::OpenSaveDialog);
+        assert_eq!(UserRegActivityType::LastVisitedApp, UserRegActivityType::LastVisitedApp);
+        assert_ne!(UserRegActivityType::TypedPath, UserRegActivityType::SearchQuery);
+        assert_ne!(UserRegActivityType::OpenSaveDialog, UserRegActivityType::LastVisitedApp);
+    }
+
+    #[test]
+    fn test_user_reg_activity_type_debug() {
+        let typed = UserRegActivityType::TypedPath;
+        let debug_str = format!("{:?}", typed);
+        assert!(debug_str.contains("TypedPath"));
+    }
+
+    #[test]
+    fn test_user_reg_activity_type_clone() {
+        let original = UserRegActivityType::SearchQuery;
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_user_reg_entry_clone() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::TypedPath,
+            username: "admin".to_string(),
+            value_name: "url1".to_string(),
+            value_data: r"C:\temp".to_string(),
+            key_last_write: None,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.activity_type, entry.activity_type);
+        assert_eq!(cloned.username, entry.username);
+        assert_eq!(cloned.value_name, entry.value_name);
+        assert_eq!(cloned.value_data, entry.value_data);
+        assert_eq!(cloned.key_last_write, entry.key_last_write);
+    }
+
+    #[test]
+    fn test_user_reg_entry_debug() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::SearchQuery,
+            username: "user1".to_string(),
+            value_name: "0".to_string(),
+            value_data: "malware download".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("UserRegEntry"));
+        assert!(debug_str.contains("SearchQuery"));
+    }
+
+    #[test]
+    fn test_user_reg_entry_with_no_last_write() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::TypedPath,
+            username: "admin".to_string(),
+            value_name: "url1".to_string(),
+            value_data: r"\\server\share".to_string(),
+            key_last_write: None,
+        };
+        assert!(entry.key_last_write.is_none());
+    }
+
+    #[test]
+    fn test_add_entry_to_store_last_visited_app() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::LastVisitedApp,
+            username: "analyst".to_string(),
+            value_name: "0".to_string(),
+            value_data: "notepad.exe".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        assert_eq!(store.len(), 1);
+        let te = store.get(0).unwrap();
+        assert!(te.path.contains("[LastVisitedApp]"));
+        assert!(te.path.contains("notepad.exe"));
+        assert_eq!(te.event_type, EventType::Execute);
+    }
+
+    #[test]
+    fn test_add_entry_to_store_uses_now_when_no_timestamp() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::TypedPath,
+            username: "user".to_string(),
+            value_name: "url1".to_string(),
+            value_data: "C:\\temp".to_string(),
+            key_last_write: None,
+        };
+        let before = chrono::Utc::now();
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let after = chrono::Utc::now();
+        let te = store.get(0).unwrap();
+        // The timestamp should be between before and after
+        assert!(te.primary_timestamp >= before);
+        assert!(te.primary_timestamp <= after);
+    }
+
+    #[test]
+    fn test_add_entry_to_store_open_save_contains_key_info() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::OpenSaveDialog,
+            username: "user1".to_string(),
+            value_name: ".xlsx/3".to_string(),
+            value_data: "budget.xlsx".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let te = store.get(0).unwrap();
+        assert!(te.path.contains(".xlsx/3"));
+        assert!(te.path.contains("budget.xlsx"));
+    }
+
+    #[test]
+    fn test_next_userreg_id_monotonic() {
+        let id1 = next_userreg_id();
+        let id2 = next_userreg_id();
+        let id3 = next_userreg_id();
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[test]
+    fn test_add_entry_to_store_source_is_ntuser() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::TypedPath,
+            username: "admin".to_string(),
+            value_name: "url1".to_string(),
+            value_data: "C:\\temp".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let te = store.get(0).unwrap();
+        assert!(matches!(&te.sources[0], ArtifactSource::Registry(s) if s == "NTUSER.DAT"));
+    }
+
+    #[test]
+    fn test_parse_open_save_mru_invalid_hive() {
+        let result = parse_open_save_mru(&[0u8; 100], "testuser");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_registry_key_path_constants() {
+        assert!(TYPED_PATHS_KEY.contains("TypedPaths"));
+        assert!(WORD_WHEEL_QUERY_KEY.contains("WordWheelQuery"));
+        assert!(OPEN_SAVE_PIDL_MRU_KEY.contains("OpenSavePidlMRU"));
+        assert!(LAST_VISITED_PIDL_MRU_KEY.contains("LastVisitedPidlMRU"));
+    }
+
+    #[test]
+    fn test_search_query_event_type_is_other() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::SearchQuery,
+            username: "user1".to_string(),
+            value_name: "0".to_string(),
+            value_data: "suspicious query".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let te = store.get(0).unwrap();
+        assert!(matches!(&te.event_type, EventType::Other(s) if s == "Search"));
+    }
+
+    #[test]
+    fn test_open_save_event_type_is_file_access() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::OpenSaveDialog,
+            username: "user1".to_string(),
+            value_name: "*/0".to_string(),
+            value_data: "file.txt".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let te = store.get(0).unwrap();
+        assert_eq!(te.event_type, EventType::FileAccess);
+    }
 }

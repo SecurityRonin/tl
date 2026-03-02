@@ -728,6 +728,509 @@ mod tests {
         assert_eq!(entry.event_type, EventType::Execute);
     }
 
+    // ─── next_shimcache_id tests ────────────────────────────────────────
+
+    #[test]
+    fn test_next_shimcache_id_increments() {
+        let id1 = next_shimcache_id();
+        let id2 = next_shimcache_id();
+        assert!(id2 > id1);
+        assert_eq!(id2 - id1, 1);
+    }
+
+    #[test]
+    fn test_next_shimcache_id_has_sh_prefix() {
+        let id = next_shimcache_id();
+        let prefix = (id >> 48) & 0xFFFF;
+        assert_eq!(prefix, 0x5348);
+    }
+
+    // ─── filetime_to_datetime edge cases ────────────────────────────────
+
+    #[test]
+    fn test_filetime_pre_unix_epoch() {
+        // A filetime that would be before Unix epoch should return None
+        let ft: u64 = 100; // very small, way before 1970
+        assert!(filetime_to_datetime(ft).is_none());
+    }
+
+    #[test]
+    fn test_filetime_at_unix_epoch() {
+        let ft: u64 = 11_644_473_600 * 10_000_000;
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result.timestamp(), 0);
+    }
+
+    #[test]
+    fn test_filetime_preserves_subseconds() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = secs as u64 * 10_000_000 + 5_000_000; // +0.5s
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result.timestamp_subsec_nanos(), 500_000_000);
+    }
+
+    // ─── read_u16_le tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_read_u16_le_valid() {
+        let data = [0x34, 0x12];
+        assert_eq!(read_u16_le(&data, 0), Some(0x1234));
+    }
+
+    #[test]
+    fn test_read_u16_le_offset() {
+        let data = [0x00, 0x00, 0xAB, 0xCD];
+        assert_eq!(read_u16_le(&data, 2), Some(0xCDAB));
+    }
+
+    #[test]
+    fn test_read_u16_le_out_of_bounds() {
+        let data = [0x34];
+        assert_eq!(read_u16_le(&data, 0), None);
+    }
+
+    #[test]
+    fn test_read_u16_le_at_boundary() {
+        let data = [0x01, 0x00];
+        assert_eq!(read_u16_le(&data, 0), Some(1));
+        assert_eq!(read_u16_le(&data, 1), None);
+    }
+
+    #[test]
+    fn test_read_u16_le_empty() {
+        let data: [u8; 0] = [];
+        assert_eq!(read_u16_le(&data, 0), None);
+    }
+
+    // ─── read_u32_le tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_read_u32_le_valid() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+        assert_eq!(read_u32_le(&data, 0), Some(0x12345678));
+    }
+
+    #[test]
+    fn test_read_u32_le_offset() {
+        let data = [0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE];
+        assert_eq!(read_u32_le(&data, 2), Some(0xDEADBEEF));
+    }
+
+    #[test]
+    fn test_read_u32_le_out_of_bounds() {
+        let data = [0x01, 0x02, 0x03];
+        assert_eq!(read_u32_le(&data, 0), None);
+    }
+
+    #[test]
+    fn test_read_u32_le_at_boundary() {
+        let data = [0x01, 0x00, 0x00, 0x00];
+        assert_eq!(read_u32_le(&data, 0), Some(1));
+        assert_eq!(read_u32_le(&data, 1), None);
+    }
+
+    #[test]
+    fn test_read_u32_le_empty() {
+        let data: [u8; 0] = [];
+        assert_eq!(read_u32_le(&data, 0), None);
+    }
+
+    #[test]
+    fn test_read_u32_le_known_magic() {
+        let data = WIN10_HEADER_MAGIC.to_le_bytes();
+        assert_eq!(read_u32_le(&data, 0), Some(WIN10_HEADER_MAGIC));
+    }
+
+    // ─── read_u64_le tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_read_u64_le_valid() {
+        let data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(read_u64_le(&data, 0), Some(1));
+    }
+
+    #[test]
+    fn test_read_u64_le_max() {
+        let data = [0xFF; 8];
+        assert_eq!(read_u64_le(&data, 0), Some(u64::MAX));
+    }
+
+    #[test]
+    fn test_read_u64_le_out_of_bounds() {
+        let data = [0x01; 7];
+        assert_eq!(read_u64_le(&data, 0), None);
+    }
+
+    #[test]
+    fn test_read_u64_le_offset() {
+        let data = [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(read_u64_le(&data, 2), Some(1));
+    }
+
+    #[test]
+    fn test_read_u64_le_empty() {
+        let data: [u8; 0] = [];
+        assert_eq!(read_u64_le(&data, 0), None);
+    }
+
+    // ─── decode_utf16le tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_decode_utf16le_empty() {
+        assert_eq!(decode_utf16le(&[]), "");
+    }
+
+    #[test]
+    fn test_decode_utf16le_ascii_path() {
+        let s = r"C:\Program Files\test.exe";
+        let encoded: Vec<u8> = s
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16le(&encoded), s);
+    }
+
+    #[test]
+    fn test_decode_utf16le_multiple_nulls() {
+        let s = "abc\0\0\0";
+        let encoded: Vec<u8> = s
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16le(&encoded), "abc");
+    }
+
+    #[test]
+    fn test_decode_utf16le_odd_byte_count() {
+        // Odd byte count: chunks_exact(2) skips the last byte
+        let data = [0x41, 0x00, 0x42]; // "A" + incomplete
+        assert_eq!(decode_utf16le(&data), "A");
+    }
+
+    #[test]
+    fn test_decode_utf16le_single_char() {
+        // 'Z' = 0x005A in UTF-16LE
+        let data = [0x5A, 0x00];
+        assert_eq!(decode_utf16le(&data), "Z");
+    }
+
+    // ─── Header magic constant tests ────────────────────────────────────
+
+    #[test]
+    fn test_win10_magic_value() {
+        assert_eq!(WIN10_HEADER_MAGIC, 0x30747331);
+    }
+
+    #[test]
+    fn test_win10_creator_magic_value() {
+        assert_eq!(WIN10_CREATOR_MAGIC, 0x34747331);
+    }
+
+    #[test]
+    fn test_win8_magic_value() {
+        assert_eq!(WIN8_HEADER_MAGIC, 0x00000080);
+    }
+
+    #[test]
+    fn test_win7_magic_value() {
+        assert_eq!(WIN7_HEADER_MAGIC, 0xbadc0fee);
+    }
+
+    #[test]
+    fn test_winxp_magic_value() {
+        assert_eq!(WINXP_HEADER_MAGIC, 0xdeadbeef);
+    }
+
+    #[test]
+    fn test_all_magics_are_distinct() {
+        let magics = [
+            WIN10_HEADER_MAGIC,
+            WIN10_CREATOR_MAGIC,
+            WIN8_HEADER_MAGIC,
+            WIN7_HEADER_MAGIC,
+            WINXP_HEADER_MAGIC,
+        ];
+        for i in 0..magics.len() {
+            for j in (i + 1)..magics.len() {
+                assert_ne!(magics[i], magics[j], "Magics at {} and {} are equal", i, j);
+            }
+        }
+    }
+
+    // ─── parse_appcompat_cache dispatch tests ───────────────────────────
+
+    #[test]
+    fn test_parse_appcompat_cache_empty() {
+        assert!(parse_appcompat_cache(&[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_appcompat_cache_three_bytes() {
+        assert!(parse_appcompat_cache(&[0x01, 0x02, 0x03]).is_err());
+    }
+
+    #[test]
+    fn test_parse_appcompat_cache_unknown_magic_short() {
+        // Unknown magic with too little data should fail via fallback parser
+        let mut data = vec![0u8; 0x40];
+        data[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let result = parse_appcompat_cache(&data);
+        assert!(result.is_err()); // fallback parser won't find entries
+    }
+
+    // ─── parse_win10 builder tests ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_win10_no_entries() {
+        // Just a header with Win10 magic, no entry data following
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_win10_empty_path_skipped() {
+        // Build entry with 0-length path
+        let mut buf = vec![0u8; 0x30];
+        buf[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+
+        // Entry sig
+        buf.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        buf.extend_from_slice(&26u32.to_le_bytes()); // cache entry size
+        buf.extend_from_slice(&0u16.to_le_bytes()); // path_len = 0
+        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        buf.extend_from_slice(&0u32.to_le_bytes()); // data_size
+
+        let entries = parse_appcompat_cache(&buf).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_build_test_win10_cache_helper() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let data = build_test_win10_cache(&[
+            (r"C:\test1.exe", ft),
+            (r"C:\test2.exe", ft),
+            (r"C:\test3.exe", ft),
+        ]);
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, r"C:\test1.exe");
+        assert_eq!(entries[2].path, r"C:\test3.exe");
+    }
+
+    #[test]
+    fn test_parse_win10_zero_timestamp() {
+        let data = build_test_win10_cache(&[(r"C:\zero_ts.exe", 0)]);
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].last_modified.is_none());
+    }
+
+    // ─── parse_win8 tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_win8_no_entries() {
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN8_HEADER_MAGIC.to_le_bytes());
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_win8_single_entry() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let path = r"C:\Windows\win8app.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN8_HEADER_MAGIC.to_le_bytes());
+
+        // Entry: path_len(4) + path + insertion_flags(4) + shim_flags(4) + timestamp(8) + data_size(4)
+        data.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+        data.extend_from_slice(&path_bytes);
+        data.extend_from_slice(&0u32.to_le_bytes()); // insertion flags
+        data.extend_from_slice(&0u32.to_le_bytes()); // shim flags
+        data.extend_from_slice(&ft.to_le_bytes()); // timestamp
+        data.extend_from_slice(&0u32.to_le_bytes()); // data size
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].last_modified, Some(dt));
+    }
+
+    // ─── parse_win7 tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_win7_zero_entries() {
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN7_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&0u32.to_le_bytes()); // num_entries = 0
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_win7_too_many_entries() {
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN7_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&3000u32.to_le_bytes()); // > 2048 limit
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    // ─── parse_winxp tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_winxp_zero_entries() {
+        let mut data = vec![0u8; 0x190];
+        data[0..4].copy_from_slice(&WINXP_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&0u32.to_le_bytes()); // num_entries = 0
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_winxp_too_many_entries() {
+        let mut data = vec![0u8; 0x190];
+        data[0..4].copy_from_slice(&WINXP_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&5000u32.to_le_bytes()); // > 2048 limit
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_winxp_single_entry() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2005, 3, 1, 8, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let path = r"C:\WINDOWS\system32\notepad.exe";
+
+        // XP format: header at 0x190, entry is 0x228 bytes
+        // Entry: path (520 bytes UTF-16LE) then 8 bytes padding, then timestamp
+        let mut data = vec![0u8; 0x190 + 0x228];
+        data[0..4].copy_from_slice(&WINXP_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&1u32.to_le_bytes()); // 1 entry
+
+        // Write path at entry offset (0x190)
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let entry_offset = 0x190;
+        data[entry_offset..entry_offset + path_bytes.len()].copy_from_slice(&path_bytes);
+
+        // Timestamp at offset 528 within entry
+        let ts_offset = entry_offset + 528;
+        data[ts_offset..ts_offset + 8].copy_from_slice(&ft.to_le_bytes());
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].last_modified, Some(dt));
+    }
+
+    // ─── ShimcacheEntry struct tests ────────────────────────────────────
+
+    #[test]
+    fn test_shimcache_entry_clone() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = ShimcacheEntry {
+            path: r"C:\test.exe".to_string(),
+            last_modified: Some(dt),
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.path, entry.path);
+        assert_eq!(cloned.last_modified, entry.last_modified);
+    }
+
+    #[test]
+    fn test_shimcache_entry_no_timestamp() {
+        let entry = ShimcacheEntry {
+            path: r"C:\unknown.exe".to_string(),
+            last_modified: None,
+        };
+        assert!(entry.last_modified.is_none());
+    }
+
+    #[test]
+    fn test_shimcache_entry_debug() {
+        let entry = ShimcacheEntry {
+            path: "debug_test".to_string(),
+            last_modified: None,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("ShimcacheEntry"));
+        assert!(debug_str.contains("debug_test"));
+    }
+
+    // ─── Win10 Creator Update magic ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_win10_creator_update_magic() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let path = r"C:\Windows\creator.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        // Creator Update header is 0x34 bytes
+        let mut buf = vec![0u8; 0x34];
+        buf[0..4].copy_from_slice(&WIN10_CREATOR_MAGIC.to_le_bytes());
+
+        // Entry with creator magic signature
+        buf.extend_from_slice(&WIN10_CREATOR_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        let entry_size = 12 + 2 + path_bytes.len() + 8 + 4;
+        buf.extend_from_slice(&(entry_size as u32).to_le_bytes());
+        buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&path_bytes);
+        buf.extend_from_slice(&ft.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // data_size
+
+        let entries = parse_appcompat_cache(&buf).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+    }
+
+    // ─── extract_appcompat_cache_value tests ────────────────────────────
+
+    #[test]
+    fn test_extract_appcompat_cache_value_invalid_hive() {
+        let result = extract_appcompat_cache_value(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_appcompat_cache_value_garbage() {
+        let result = extract_appcompat_cache_value(&[0xFFu8; 256]);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_empty_manifest_no_error() {
         use crate::collection::manifest::ArtifactManifest;

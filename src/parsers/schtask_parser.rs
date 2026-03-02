@@ -464,4 +464,224 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_local_name_with_namespace() {
+        assert_eq!(local_name(b"ns:Task"), "Task");
+    }
+
+    #[test]
+    fn test_local_name_no_namespace() {
+        assert_eq!(local_name(b"Task"), "Task");
+    }
+
+    #[test]
+    fn test_local_name_empty() {
+        assert_eq!(local_name(b""), "");
+    }
+
+    #[test]
+    fn test_parse_task_date_empty() {
+        assert!(parse_task_date("").is_none());
+    }
+
+    #[test]
+    fn test_parse_task_date_no_fractional() {
+        let dt = parse_task_date("2025-06-15T10:30:00").unwrap();
+        let expected = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        assert_eq!(dt, expected);
+    }
+
+    #[test]
+    fn test_parse_task_date_short_fractional() {
+        let dt = parse_task_date("2025-06-15T10:30:00.123").unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-06-15");
+    }
+
+    #[test]
+    fn test_parse_task_date_7_digit_fractional() {
+        // Should truncate to 6 digits
+        let dt = parse_task_date("2025-06-15T10:30:00.1234567").unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-06-15");
+    }
+
+    #[test]
+    fn test_parse_task_date_6_digit_fractional() {
+        let dt = parse_task_date("2025-06-15T10:30:00.123456").unwrap();
+        assert!(dt.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn test_parse_task_date_invalid() {
+        assert!(parse_task_date("not a date").is_none());
+    }
+
+    #[test]
+    fn test_build_schtask_description_no_arguments() {
+        let task = ScheduledTaskEntry {
+            uri: r"\TestTask".to_string(),
+            author: "admin".to_string(),
+            registration_date: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            command: "cmd.exe".to_string(),
+            arguments: None,
+        };
+        let desc = build_schtask_description(&task);
+        assert!(desc.contains("[SchedTask]"));
+        assert!(desc.contains("TestTask"));
+        assert!(desc.contains("cmd.exe"));
+        assert!(desc.contains("admin"));
+        // No arguments, so no extra space in the format
+        assert!(!desc.contains("  "));
+    }
+
+    #[test]
+    fn test_build_schtask_description_with_arguments() {
+        let task = ScheduledTaskEntry {
+            uri: r"\MyTask".to_string(),
+            author: "SYSTEM".to_string(),
+            registration_date: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            command: "powershell.exe".to_string(),
+            arguments: Some("-ep bypass".to_string()),
+        };
+        let desc = build_schtask_description(&task);
+        assert!(desc.contains("powershell.exe"));
+        assert!(desc.contains("-ep bypass"));
+    }
+
+    #[test]
+    fn test_build_schtask_description_empty_arguments() {
+        let task = ScheduledTaskEntry {
+            uri: r"\TestTask".to_string(),
+            author: "admin".to_string(),
+            registration_date: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            command: "cmd.exe".to_string(),
+            arguments: Some("".to_string()),
+        };
+        let desc = build_schtask_description(&task);
+        // Empty arguments should be treated like None
+        assert!(!desc.contains("  "));
+    }
+
+    #[test]
+    fn test_parse_task_com_handler_command_format() {
+        let task = parse_task_xml(task_with_com_handler_xml()).unwrap();
+        assert!(task.command.starts_with("COM:"));
+    }
+
+    #[test]
+    fn test_parse_task_no_date_returns_none() {
+        let xml = r#"<?xml version="1.0"?>
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>admin</Author>
+    <URI>\NoDateTask</URI>
+  </RegistrationInfo>
+  <Actions>
+    <Exec>
+      <Command>cmd.exe</Command>
+    </Exec>
+  </Actions>
+</Task>"#;
+        // No date => parse_task_date("") => None => parse_task_xml returns None
+        assert!(parse_task_xml(xml).is_none());
+    }
+
+    #[test]
+    fn test_parse_task_no_command_returns_none() {
+        let xml = r#"<?xml version="1.0"?>
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2025-01-01T00:00:00</Date>
+    <URI>\NoCommandTask</URI>
+  </RegistrationInfo>
+  <Actions>
+    <Exec>
+      <Arguments>-hidden</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+        // No Command element => command is empty => None
+        assert!(parse_task_xml(xml).is_none());
+    }
+
+    #[test]
+    fn test_decode_task_xml_utf8() {
+        let data = b"<?xml version=\"1.0\"?><Task/>";
+        let result = decode_task_xml(data);
+        assert!(result.contains("Task"));
+    }
+
+    #[test]
+    fn test_decode_task_xml_utf16le_bom() {
+        let xml_str = "<Task/>";
+        let mut data: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for c in xml_str.encode_utf16() {
+            data.extend_from_slice(&c.to_le_bytes());
+        }
+        let result = decode_task_xml(&data);
+        assert!(result.contains("Task"));
+    }
+
+    #[test]
+    fn test_decode_task_xml_utf16be_bom() {
+        let xml_str = "<Task/>";
+        let mut data: Vec<u8> = vec![0xFE, 0xFF]; // UTF-16BE BOM
+        for c in xml_str.encode_utf16() {
+            data.extend_from_slice(&c.to_be_bytes());
+        }
+        let result = decode_task_xml(&data);
+        assert!(result.contains("Task"));
+    }
+
+    #[test]
+    fn test_next_schtask_id_increments() {
+        let id1 = next_schtask_id();
+        let id2 = next_schtask_id();
+        assert!(id2 > id1);
+        assert_eq!(id1 >> 48, 0x5354);
+    }
+
+    #[test]
+    fn test_scheduled_task_entry_debug_clone() {
+        let task = ScheduledTaskEntry {
+            uri: r"\test".to_string(),
+            author: "admin".to_string(),
+            registration_date: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            command: "cmd.exe".to_string(),
+            arguments: Some("/c dir".to_string()),
+        };
+        let cloned = task.clone();
+        assert_eq!(cloned.uri, task.uri);
+        let debug_str = format!("{:?}", task);
+        assert!(debug_str.contains("cmd.exe"));
+    }
+
+    #[test]
+    fn test_parse_task_xml_error_returns_none() {
+        // Malformed XML that quick_xml will error on
+        let xml = "<<<<<";
+        assert!(parse_task_xml(xml).is_none());
+    }
+
+    #[test]
+    fn test_parse_task_with_exec_no_arguments() {
+        let xml = r#"<?xml version="1.0"?>
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2025-01-01T00:00:00</Date>
+    <Author>admin</Author>
+    <URI>\SimpleTask</URI>
+  </RegistrationInfo>
+  <Actions>
+    <Exec>
+      <Command>notepad.exe</Command>
+    </Exec>
+  </Actions>
+</Task>"#;
+        let task = parse_task_xml(xml).unwrap();
+        assert_eq!(task.command, "notepad.exe");
+        assert!(task.arguments.is_none());
+    }
 }

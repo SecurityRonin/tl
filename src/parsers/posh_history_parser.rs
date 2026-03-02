@@ -228,4 +228,171 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_posh_history_whitespace_only_lines() {
+        let content = "  \n\t\n   \n";
+        let entries = parse_posh_history(content, "admin");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_posh_history_leading_trailing_whitespace() {
+        let content = "  Get-Process  \n  dir  \n";
+        let entries = parse_posh_history(content, "admin");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, "Get-Process");
+        assert_eq!(entries[1].command, "dir");
+    }
+
+    #[test]
+    fn test_parse_posh_history_single_command() {
+        let content = "whoami";
+        let entries = parse_posh_history(content, "admin");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "whoami");
+        assert_eq!(entries[0].line_number, 1);
+        assert_eq!(entries[0].username, "admin");
+    }
+
+    #[test]
+    fn test_parse_posh_history_special_characters() {
+        let content = "Get-Content C:\\Users\\admin\\file.txt | Select-String 'password'\nInvoke-Expression \"cmd /c echo %USERPROFILE%\"\n$env:PATH -split ';'\n";
+        let entries = parse_posh_history(content, "attacker");
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].command.contains("Select-String"));
+        assert!(entries[1].command.contains("Invoke-Expression"));
+        assert!(entries[2].command.contains("$env:PATH"));
+    }
+
+    #[test]
+    fn test_parse_posh_history_crlf_line_endings() {
+        let content = "Get-Process\r\nGet-Service\r\ndir\r\n";
+        let entries = parse_posh_history(content, "admin");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].command, "Get-Process");
+        assert_eq!(entries[1].command, "Get-Service");
+        assert_eq!(entries[2].command, "dir");
+    }
+
+    #[test]
+    fn test_parse_posh_history_preserves_username() {
+        let content = "cmd1\ncmd2\n";
+        let entries = parse_posh_history(content, "SYSTEM");
+        for entry in &entries {
+            assert_eq!(entry.username, "SYSTEM");
+        }
+    }
+
+    #[test]
+    fn test_parse_posh_history_line_numbers_correct_with_gaps() {
+        let content = "\n\ncmd1\n\ncmd2\n\n\ncmd3\n";
+        let entries = parse_posh_history(content, "u");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].line_number, 3);
+        assert_eq!(entries[1].line_number, 5);
+        assert_eq!(entries[2].line_number, 8);
+    }
+
+    #[test]
+    fn test_extract_username_case_insensitive() {
+        let path = r"C:\USERS\TestUser\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt";
+        assert_eq!(extract_username_from_path(path), "TestUser");
+    }
+
+    #[test]
+    fn test_extract_username_lowercase_users() {
+        let path = r"c:\users\lowercaseuser\appdata\roaming\microsoft\windows\powershell\psreadline\consolehost_history.txt";
+        assert_eq!(extract_username_from_path(path), "lowercaseuser");
+    }
+
+    #[test]
+    fn test_extract_username_forward_slashes() {
+        let path = "C:/Users/admin/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt";
+        assert_eq!(extract_username_from_path(path), "admin");
+    }
+
+    #[test]
+    fn test_extract_username_users_with_trailing_slash_no_name() {
+        // "Users\" is at the end with nothing meaningful after it
+        let path = r"C:\Other\random_file.txt";
+        assert_eq!(extract_username_from_path(path), "Unknown");
+    }
+
+    #[test]
+    fn test_extract_username_empty_path() {
+        assert_eq!(extract_username_from_path(""), "Unknown");
+    }
+
+    #[test]
+    fn test_extract_username_no_users_folder() {
+        let path = r"D:\Data\PowerShell\ConsoleHost_history.txt";
+        assert_eq!(extract_username_from_path(path), "Unknown");
+    }
+
+    #[test]
+    fn test_posh_entry_clone() {
+        let entry = PoshHistoryEntry {
+            command: "Get-Process".to_string(),
+            username: "admin".to_string(),
+            line_number: 1,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.command, entry.command);
+        assert_eq!(cloned.username, entry.username);
+        assert_eq!(cloned.line_number, entry.line_number);
+    }
+
+    #[test]
+    fn test_posh_entry_debug() {
+        let entry = PoshHistoryEntry {
+            command: "whoami".to_string(),
+            username: "root".to_string(),
+            line_number: 42,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("PoshHistoryEntry"));
+        assert!(debug_str.contains("whoami"));
+    }
+
+    #[test]
+    fn test_next_posh_id_monotonic() {
+        let id1 = next_posh_id();
+        let id2 = next_posh_id();
+        let id3 = next_posh_id();
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[test]
+    fn test_next_posh_id_has_ps_prefix() {
+        let id = next_posh_id();
+        assert_eq!((id >> 48) & 0xFFFF, 0x5053);
+    }
+
+    #[test]
+    fn test_parse_posh_history_very_long_command() {
+        let long_cmd = "A".repeat(10_000);
+        let content = format!("{}\n", long_cmd);
+        let entries = parse_posh_history(&content, "admin");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command.len(), 10_000);
+    }
+
+    #[test]
+    fn test_parse_posh_history_unicode_commands() {
+        let content = "Write-Output '\u{4e2d}\u{6587}'\necho '\u{00e9}'\n";
+        let entries = parse_posh_history(content, "user");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].command.contains('\u{4e2d}'));
+    }
+
+    #[test]
+    fn test_extract_username_velociraptor_style_users() {
+        // Another Velociraptor-style path with forward slashes
+        let path = "uploads/auto/Windows.KapeFiles.Targets/Users/hacker/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt";
+        assert_eq!(extract_username_from_path(path), "hacker");
+    }
 }
