@@ -208,12 +208,12 @@ fn test_skip_zero_filled_regions() {
 }
 
 #[test]
-fn test_skip_v3_records() {
+fn test_v3_records_parsed() {
     use chrono::{TimeZone, Utc};
 
     let ts = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
 
-    // Build a "V3" record (MajorVersion=3) -- should be skipped
+    // Build a "V3" record (MajorVersion=3) -- usnjrnl parses V3 (ReFS 128-bit refs)
     let mut v3_buf = build_usn_record_v2(
         10, 1, 5, 1, 100,
         datetime_to_filetime(ts),
@@ -233,8 +233,9 @@ fn test_skip_v3_records() {
     data.extend(v2_buf);
 
     let records = parse_usn_journal(&data).unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].filename, "v2file.txt");
+    // Both V2 and V3 records are now parsed (V3 support via usnjrnl crate)
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].filename, "v2file.txt");
 }
 
 #[test]
