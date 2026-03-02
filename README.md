@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-445-green.svg)](https://github.com/h4x0r/tl)
 
-**Author:** Albert Hui ([@h4x0r](https://github.com/h4x0r), [@SecurityRonin](https://github.com/SecurityRonin))
+**Author:** Albert Hui ([@h4x0r](https://github.com/h4x0r)) of [@SecurityRonin](https://github.com/SecurityRonin)
 
 A fast forensic triage timeline generator that ingests Velociraptor collections and produces a unified, chronologically sorted timeline from 25+ Windows artifact types. Built in Rust with an interactive TUI, multiple export formats, and a built-in Sigma detection engine.
 
