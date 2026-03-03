@@ -764,4 +764,297 @@ mod tests {
         let te = store.get(0).unwrap();
         assert_eq!(te.event_type, EventType::FileAccess);
     }
+
+    // ─── Pipeline integration and parsing coverage ───────────────────────
+
+    #[test]
+    fn test_parse_user_registry_skips_non_ntuser_hives() {
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SAM", 'C'),
+            hive_type: RegistryHiveType::Sam,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct PanicProvider;
+        impl CollectionProvider for PanicProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("Should not be called for non-NTUSER hives")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_user_registry(&PanicProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_user_registry_with_failing_provider() {
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("Disk I/O error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_user_registry(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_user_registry_with_invalid_hive_data() {
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xBA, 0xAD, 0xF0, 0x0D].into_iter().cycle().take(2048).collect())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // All three parse functions (typed_paths, word_wheel_query, open_save_mru)
+        // will fail to parse the hive, errors are logged but not propagated
+        let result = parse_user_registry(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_user_registry_multiple_ntuser_hives() {
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/analyst/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "analyst".to_string(),
+            },
+        });
+
+        let mut store = TimelineStore::new();
+
+        use std::sync::atomic::AtomicU32;
+        static UR_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+        struct CountingProvider;
+        impl CollectionProvider for CountingProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                UR_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![0u8; 512]) // invalid but won't crash
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        UR_CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let result = parse_user_registry(&CountingProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(UR_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_decode_utf16le_long_string() {
+        let input = "Hello, World! This is a long UTF-16 test string.";
+        let data: Vec<u8> = input
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16le(&data), input);
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_ascii_fallback_with_spaces() {
+        // Starts with null (empty UTF-16), falls back to ASCII, has spaces
+        let mut data = vec![0x00, 0x00, 0x00, 0x00]; // null UTF-16
+        data.extend_from_slice(b"  hello world  ");
+        let result = extract_filename_from_binary(&data);
+        assert!(result.contains("hello world"));
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_ascii_fallback_non_graphic() {
+        // Starts with null (empty UTF-16), has non-graphic chars
+        let mut data = vec![0x00, 0x00, 0x00, 0x00]; // null UTF-16
+        data.extend_from_slice(&[0x01, 0x02, 0x03, b'A', b'B']); // control chars + AB
+        let result = extract_filename_from_binary(&data);
+        assert!(result.contains("AB"));
+    }
+
+    #[test]
+    fn test_add_entry_to_store_all_activity_types() {
+        let types_and_expected = vec![
+            (UserRegActivityType::TypedPath, "[TypedPath]", EventType::FileAccess),
+            (UserRegActivityType::SearchQuery, "[SearchQuery]", EventType::Other("Search".to_string())),
+            (UserRegActivityType::OpenSaveDialog, "[OpenSave]", EventType::FileAccess),
+            (UserRegActivityType::LastVisitedApp, "[LastVisitedApp]", EventType::Execute),
+        ];
+
+        for (activity_type, expected_prefix, expected_event_type) in types_and_expected {
+            let entry = UserRegEntry {
+                activity_type,
+                username: "testuser".to_string(),
+                value_name: "val1".to_string(),
+                value_data: "testdata".to_string(),
+                key_last_write: Some(chrono::Utc::now()),
+            };
+            let mut store = TimelineStore::new();
+            add_entry_to_store(&mut store, &entry);
+            let te = store.get(0).unwrap();
+            assert!(te.path.contains(expected_prefix));
+            assert!(te.path.contains("testdata"));
+            assert!(te.path.contains("testuser"));
+            assert_eq!(te.event_type, expected_event_type);
+        }
+    }
+
+    #[test]
+    fn test_next_userreg_id_has_ur_prefix() {
+        let id = next_userreg_id();
+        assert_eq!((id >> 48) & 0xFFFF, 0x5552);
+    }
+
+    #[test]
+    fn test_parse_typed_paths_empty_hive() {
+        let result = parse_typed_paths(&[], "admin");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_word_wheel_query_empty_hive() {
+        let result = parse_word_wheel_query(&[], "admin");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_open_save_mru_empty_hive() {
+        let result = parse_open_save_mru(&[], "admin");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utf16le_surrogate_pair() {
+        // Test with a character outside BMP (emoji: U+1F600)
+        // UTF-16 surrogate pair: 0xD83D 0xDE00
+        let data = [0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00]; // surrogate pair + null
+        let result = decode_utf16le(&data);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_filename_from_binary_pure_ascii() {
+        // Non-null UTF-16 first char, so it's read as UTF-16
+        let data = b"N\x00o\x00t\x00e\x00p\x00a\x00d\x00\x00\x00";
+        assert_eq!(extract_filename_from_binary(data), "Notepad");
+    }
+
+    #[test]
+    fn test_add_entry_to_store_search_query_contains_quotes() {
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::SearchQuery,
+            username: "user".to_string(),
+            value_name: "0".to_string(),
+            value_data: "how to hack".to_string(),
+            key_last_write: Some(chrono::Utc::now()),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let te = store.get(0).unwrap();
+        // SearchQuery wraps the data in quotes
+        assert!(te.path.contains("\"how to hack\""));
+    }
+
+    #[test]
+    fn test_user_reg_entry_with_some_timestamp() {
+        use chrono::TimeZone;
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        let entry = UserRegEntry {
+            activity_type: UserRegActivityType::TypedPath,
+            username: "admin".to_string(),
+            value_name: "url1".to_string(),
+            value_data: r"C:\temp".to_string(),
+            key_last_write: Some(ts),
+        };
+        let mut store = TimelineStore::new();
+        add_entry_to_store(&mut store, &entry);
+        let te = store.get(0).unwrap();
+        assert_eq!(te.primary_timestamp, ts);
+    }
 }

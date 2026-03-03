@@ -893,4 +893,484 @@ mod tests {
         let result = parse_automatic_destinations(&data, "test.automaticDestinations-ms");
         assert!(result.is_err());
     }
+
+    // ─── Tests targeting uncovered lines ─────────────────────────────────
+
+    #[test]
+    fn test_parse_embedded_lnk_with_link_info_zero_local_base_path_offset() {
+        // Build LNK with HAS_LINK_INFO, but LocalBasePathOffset = 0
+        let mut lnk = vec![0u8; 200];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE;
+        lnk[info_start..info_start + 4].copy_from_slice(&100u32.to_le_bytes()); // LinkInfoSize
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes()); // HeaderSize
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&1u32.to_le_bytes()); // Flags: local
+        lnk[info_start + 12..info_start + 16].copy_from_slice(&28u32.to_le_bytes()); // VolumeIDOffset
+        // LocalBasePathOffset = 0 -> should NOT extract path
+        lnk[info_start + 16..info_start + 20].copy_from_slice(&0u32.to_le_bytes());
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_with_link_info_no_local_flag() {
+        // Build LNK with HAS_LINK_INFO, but LinkInfoFlags = 0 (no local path)
+        let mut lnk = vec![0u8; 200];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE;
+        lnk[info_start..info_start + 4].copy_from_slice(&100u32.to_le_bytes()); // LinkInfoSize
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes());
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&0u32.to_le_bytes()); // Flags: 0 = no local
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_with_link_info_too_small() {
+        // HAS_LINK_INFO set, but LinkInfoSize < 28
+        let mut lnk = vec![0u8; 120];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE;
+        lnk[info_start..info_start + 4].copy_from_slice(&20u32.to_le_bytes()); // too small
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_with_both_flags() {
+        use chrono::TimeZone;
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        // Build LNK with both HAS_LINK_TARGET_ID_LIST and HAS_LINK_INFO
+        let flags = HAS_LINK_TARGET_ID_LIST | HAS_LINK_INFO;
+        let mut lnk = vec![0u8; 300];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&flags.to_le_bytes());
+        lnk[28..36].copy_from_slice(&datetime_to_filetime(created).to_le_bytes());
+
+        // IDList at offset 0x4C: size = 4 (small)
+        let id_list_offset = LNK_HEADER_SIZE;
+        lnk[id_list_offset..id_list_offset + 2].copy_from_slice(&4u16.to_le_bytes());
+        // 4 bytes of dummy IDList
+        // LinkInfo starts after IDList: id_list_offset + 2 + 4 = 0x52
+        let info_start = id_list_offset + 2 + 4;
+        lnk[info_start..info_start + 4].copy_from_slice(&100u32.to_le_bytes());
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes());
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&1u32.to_le_bytes()); // local
+        lnk[info_start + 12..info_start + 16].copy_from_slice(&28u32.to_le_bytes());
+        let path_offset = 60u32;
+        lnk[info_start + 16..info_start + 20].copy_from_slice(&path_offset.to_le_bytes());
+
+        let path_str = b"C:\\test\\app.exe\x00";
+        let abs_offset = info_start + path_offset as usize;
+        lnk[abs_offset..abs_offset + path_str.len()].copy_from_slice(path_str);
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, cr, _, _) = result.unwrap();
+        assert_eq!(target_path, Some(r"C:\test\app.exe".to_string()));
+        assert_eq!(cr, Some(created));
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_link_info_path_at_end_of_data() {
+        // LinkInfo with path that points near end of buffer
+        // info_start = 0x4C = 76; path_offset = 50; abs = 76+50 = 126
+        // We need lnk to be at least 126 + 4 = 130, and info_start + link_info_size <= lnk.len()
+        let mut lnk = vec![0u8; 140];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE; // 0x4C = 76
+        // link_info_size = 64, so info_start + 64 = 140 = lnk.len() (fits exactly)
+        lnk[info_start..info_start + 4].copy_from_slice(&64u32.to_le_bytes());
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes());
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&1u32.to_le_bytes());
+        lnk[info_start + 12..info_start + 16].copy_from_slice(&28u32.to_le_bytes());
+        // Path offset = 50, abs = 76 + 50 = 126
+        let path_offset = 50u32;
+        lnk[info_start + 16..info_start + 20].copy_from_slice(&path_offset.to_le_bytes());
+
+        let abs = info_start + path_offset as usize; // 126
+        lnk[abs] = b'D';
+        lnk[abs + 1] = b':';
+        lnk[abs + 2] = b'\\';
+        lnk[abs + 3] = 0;
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert_eq!(target_path, Some(r"D:\".to_string()));
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_link_info_empty_path_string() {
+        // Path data that starts with NUL -> empty path -> target_path stays None
+        let mut lnk = vec![0u8; 200];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE;
+        lnk[info_start..info_start + 4].copy_from_slice(&100u32.to_le_bytes());
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes());
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&1u32.to_le_bytes());
+        lnk[info_start + 12..info_start + 16].copy_from_slice(&28u32.to_le_bytes());
+        let path_offset = 60u32;
+        lnk[info_start + 16..info_start + 20].copy_from_slice(&path_offset.to_le_bytes());
+        // Path data is all zeros (NUL) -> empty string -> path stays None
+        // (data is already zeroed)
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_partial_lnk_header_at_end() {
+        // Data ends mid-way through what looks like an LNK header
+        let mut data = vec![0xAA; 80];
+        // Put LNK magic at offset 70 but only leave ~10 bytes (less than LNK_HEADER_SIZE)
+        data[70..74].copy_from_slice(&0x4Cu32.to_le_bytes());
+        // Not enough room for full header -> won't parse
+        let results = parse_custom_destinations(&data, "test.customDestinations-ms").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_fallback_path_on_no_target() {
+        use chrono::TimeZone;
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+
+        let lnk = build_minimal_lnk(0, 0, datetime_to_filetime(written));
+        let mut data = Vec::new();
+        data.extend_from_slice(&lnk);
+
+        let results = parse_custom_destinations(&data, "test.customDestinations-ms").unwrap();
+        assert_eq!(results.len(), 1);
+        // No LinkInfo -> target_path is None -> fallback path with offset
+        assert!(results[0].0.contains("test.customDestinations-ms:offset_0x0"));
+    }
+
+    #[test]
+    fn test_parse_jump_lists_with_auto_file_open_error() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_auto.push(
+            NormalizedPath::from_image_path("/Users/test/AutomaticDestinations/abc.auto", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_with_custom_file_open_error() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/Users/test/CustomDestinations/abc.custom", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_auto_file_too_large() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_auto.push(
+            NormalizedPath::from_image_path("/Users/test/big.auto", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct HugeProvider;
+        impl CollectionProvider for HugeProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Return data larger than MAX_JUMPLIST_SIZE
+                Ok(vec![0u8; MAX_JUMPLIST_SIZE + 1])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&HugeProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_custom_file_too_large() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/Users/test/big.custom", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct HugeProvider;
+        impl CollectionProvider for HugeProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0u8; MAX_JUMPLIST_SIZE + 1])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&HugeProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_auto_invalid_compound_file() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_auto.push(
+            NormalizedPath::from_image_path("/Users/test/bad.auto", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct BadDataProvider;
+        impl CollectionProvider for BadDataProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Not a valid OLE compound file
+                Ok(vec![0xAA; 512])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&BadDataProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_custom_with_entries() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+        use chrono::TimeZone;
+
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let accessed = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+
+        let lnk = build_minimal_lnk(
+            datetime_to_filetime(created),
+            datetime_to_filetime(accessed),
+            datetime_to_filetime(written),
+        );
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/Users/test/test.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+        let lnk_data = lnk.clone();
+
+        struct LnkProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for LnkProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = LnkProvider { data: lnk_data };
+        let result = parse_jump_lists(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Should have created timeline entries from the embedded LNK
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_entries_with_no_timestamps() {
+        // LNK with all zero timestamps -> no primary_timestamp -> entry skipped
+        let lnk = build_minimal_lnk(0, 0, 0);
+        let results = parse_custom_destinations(&lnk, "test.customDestinations-ms").unwrap();
+        assert_eq!(results.len(), 1);
+        // All timestamps are None
+        let (_, created, modified, accessed) = &results[0];
+        assert!(created.is_none());
+        assert!(modified.is_none());
+        assert!(accessed.is_none());
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_link_info_path_beyond_data() {
+        // LinkInfo with LocalBasePathOffset pointing beyond the actual data
+        let mut lnk = vec![0u8; 120];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE;
+        lnk[info_start..info_start + 4].copy_from_slice(&50u32.to_le_bytes());
+        lnk[info_start + 4..info_start + 8].copy_from_slice(&28u32.to_le_bytes());
+        lnk[info_start + 8..info_start + 12].copy_from_slice(&1u32.to_le_bytes());
+        lnk[info_start + 12..info_start + 16].copy_from_slice(&28u32.to_le_bytes());
+        // Path offset that, when added to info_start, points beyond data
+        lnk[info_start + 16..info_start + 20].copy_from_slice(&200u32.to_le_bytes());
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_none());
+    }
+
+    #[test]
+    fn test_read_ascii_string_offset_beyond_data() {
+        let data = b"hello";
+        // offset equals length -> empty result
+        let result = read_ascii_string(data, 5, 10);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_read_ascii_string_max_len_zero() {
+        let data = b"hello";
+        let result = read_ascii_string(data, 0, 0);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_filetime_epoch_boundary() {
+        use chrono::TimeZone;
+        let epoch_diff: u64 = 11_644_473_600;
+        let ft = epoch_diff * 10_000_000;
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_extract_app_id_just_filename_no_path() {
+        assert_eq!(
+            extract_app_id("abcdef1234567890.automaticDestinations-ms"),
+            Some("abcdef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_embedded_lnk_link_info_extends_beyond_data() {
+        // LinkInfoSize says 200 but data only has 100 bytes from info_start
+        let mut lnk = vec![0u8; LNK_HEADER_SIZE + 50];
+        lnk[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        lnk[4..20].copy_from_slice(&LNK_CLSID);
+        lnk[20..24].copy_from_slice(&HAS_LINK_INFO.to_le_bytes());
+
+        let info_start = LNK_HEADER_SIZE;
+        // LinkInfoSize = 200, but we only have 50 bytes after info_start
+        lnk[info_start..info_start + 4].copy_from_slice(&200u32.to_le_bytes());
+
+        let result = parse_embedded_lnk(&lnk);
+        assert!(result.is_some());
+        let (target_path, _, _, _) = result.unwrap();
+        assert!(target_path.is_none()); // LinkInfo couldn't be parsed
+    }
 }

@@ -1131,4 +1131,458 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Mock provider for parse_srum integration tests ─────────────────
+
+    struct TestProvider {
+        data: Vec<u8>,
+        should_fail: bool,
+    }
+
+    impl TestProvider {
+        fn with_data(data: Vec<u8>) -> Self {
+            Self { data, should_fail: false }
+        }
+        fn failing() -> Self {
+            Self { data: vec![], should_fail: true }
+        }
+    }
+
+    impl CollectionProvider for TestProvider {
+        fn discover(&self) -> ArtifactManifest {
+            ArtifactManifest::default()
+        }
+        fn open_file(
+            &self,
+            _path: &crate::collection::path::NormalizedPath,
+        ) -> Result<Vec<u8>> {
+            if self.should_fail {
+                anyhow::bail!("mock open_file failure")
+            }
+            Ok(self.data.clone())
+        }
+        fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+            crate::collection::provider::CollectionMetadata::default()
+        }
+    }
+
+    // ─── parse_srum provider failure tests ──────────────────────────────
+
+    #[test]
+    fn test_parse_srum_open_file_fails_continues() {
+        let path = crate::collection::path::NormalizedPath::from_image_path(
+            "/Windows/System32/sru/SRUDB.dat", 'C',
+        );
+        let mut manifest = ArtifactManifest::default();
+        manifest.srum.push(path);
+
+        let provider = TestProvider::failing();
+        let mut store = TimelineStore::new();
+
+        let result = parse_srum(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_srum_invalid_ese_data_continues() {
+        let path = crate::collection::path::NormalizedPath::from_image_path(
+            "/Windows/System32/sru/SRUDB.dat", 'C',
+        );
+        let mut manifest = ArtifactManifest::default();
+        manifest.srum.push(path);
+
+        // Garbage data that is not a valid ESE database
+        let provider = TestProvider::with_data(vec![0xFF, 0xFE, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        let mut store = TimelineStore::new();
+
+        let result = parse_srum(&provider, &manifest, &mut store);
+        assert!(result.is_ok()); // Should not propagate error, just continue
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_srum_empty_data_continues() {
+        let path = crate::collection::path::NormalizedPath::from_image_path(
+            "/Windows/System32/sru/SRUDB.dat", 'C',
+        );
+        let mut manifest = ArtifactManifest::default();
+        manifest.srum.push(path);
+
+        let provider = TestProvider::with_data(vec![]);
+        let mut store = TimelineStore::new();
+
+        let result = parse_srum(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_srum_multiple_paths_all_fail() {
+        let path1 = crate::collection::path::NormalizedPath::from_image_path(
+            "/Windows/System32/sru/SRUDB.dat", 'C',
+        );
+        let path2 = crate::collection::path::NormalizedPath::from_image_path(
+            "/OtherLocation/SRUDB.dat", 'C',
+        );
+        let mut manifest = ArtifactManifest::default();
+        manifest.srum.push(path1);
+        manifest.srum.push(path2);
+
+        let provider = TestProvider::with_data(vec![0xDE, 0xAD]);
+        let mut store = TimelineStore::new();
+
+        let result = parse_srum(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    // ─── resolve_id extended edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_resolve_id_binary_value_returns_question() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Binary(vec![0x01, 0x02]);
+        assert_eq!(resolve_id(&val, &map), "?");
+    }
+
+    #[test]
+    fn test_resolve_id_i32_negative() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(-1, "negative_app".to_string());
+        let val = libesedb::Value::I32(-1);
+        assert_eq!(resolve_id(&val, &map), "negative_app");
+    }
+
+    #[test]
+    fn test_resolve_id_i32_zero() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(0, "zero_app".to_string());
+        let val = libesedb::Value::I32(0);
+        assert_eq!(resolve_id(&val, &map), "zero_app");
+    }
+
+    #[test]
+    fn test_resolve_id_u32_zero_without_map() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::U32(0);
+        assert_eq!(resolve_id(&val, &map), "ID:0");
+    }
+
+    #[test]
+    fn test_resolve_id_u32_large_value() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::U32(u32::MAX);
+        let result = resolve_id(&val, &map);
+        assert!(result.starts_with("ID:"));
+    }
+
+    #[test]
+    fn test_resolve_id_text_empty() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Text(String::new());
+        assert_eq!(resolve_id(&val, &map), "");
+    }
+
+    #[test]
+    fn test_resolve_id_large_text_empty() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::LargeText(String::new());
+        assert_eq!(resolve_id(&val, &map), "");
+    }
+
+    #[test]
+    fn test_resolve_id_text_with_special_chars() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Text(r"C:\Program Files (x86)\App\app.exe".to_string());
+        assert_eq!(resolve_id(&val, &map), r"C:\Program Files (x86)\App\app.exe");
+    }
+
+    // ─── format_bytes additional edge cases ─────────────────────────────
+
+    #[test]
+    fn test_format_bytes_u64_max() {
+        let result = format_bytes(u64::MAX);
+        assert!(result.contains("GB"), "expected GB for max u64, got: {}", result);
+    }
+
+    #[test]
+    fn test_format_bytes_exact_gb_boundary() {
+        // Exactly 1 GB = 1073741824
+        assert_eq!(format_bytes(1073741824), "1.0 GB");
+    }
+
+    #[test]
+    fn test_format_bytes_just_over_gb() {
+        // 1 GB + 1 byte
+        let result = format_bytes(1073741825);
+        assert!(result.contains("GB"), "expected GB, got: {}", result);
+    }
+
+    // ─── filetime_to_datetime extended tests ────────────────────────────
+
+    #[test]
+    fn test_filetime_to_datetime_year_2000() {
+        let dt = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = secs as u64 * 10_000_000;
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result, dt);
+    }
+
+    #[test]
+    fn test_filetime_to_datetime_with_nanos() {
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        // Add 1234567 100ns intervals
+        let ft = secs as u64 * 10_000_000 + 1_234_567;
+        let result = filetime_to_datetime(ft).unwrap();
+        // nanos = 1234567 * 100 = 123456700
+        assert_eq!(result.timestamp_subsec_nanos(), 123_456_700);
+    }
+
+    #[test]
+    fn test_filetime_to_datetime_max_subsecond() {
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        // 9999999 100ns intervals = 0.9999999 seconds
+        let ft = secs as u64 * 10_000_000 + 9_999_999;
+        let result = filetime_to_datetime(ft).unwrap();
+        assert_eq!(result.timestamp_subsec_nanos(), 999_999_900);
+    }
+
+    // ─── SrumAppEntry description format ────────────────────────────────
+
+    #[test]
+    fn test_srum_app_desc_with_large_cycle_times() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let srum = SrumAppEntry {
+            app_id: "heavy_app.exe".to_string(),
+            user_sid: "S-1-5-21-999".to_string(),
+            timestamp: ts,
+            foreground_cycle_time: u64::MAX,
+            background_cycle_time: u64::MAX,
+            face_time: u64::MAX,
+        };
+        let desc = format!(
+            "[SRUM:App] {} user:{} fg:{} bg:{} face:{}",
+            srum.app_id, srum.user_sid,
+            srum.foreground_cycle_time, srum.background_cycle_time, srum.face_time,
+        );
+        assert!(desc.contains("heavy_app.exe"));
+        assert!(desc.contains("18446744073709551615")); // u64::MAX
+    }
+
+    // ─── SrumNetworkEntry description with format_bytes ─────────────────
+
+    #[test]
+    fn test_srum_net_desc_very_large_transfer() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let net = SrumNetworkEntry {
+            app_id: "exfil.exe".to_string(),
+            user_sid: "S-1-5-21-1234".to_string(),
+            timestamp: ts,
+            bytes_sent: 10_737_418_240, // 10 GB
+            bytes_received: 1_073_741_824, // 1 GB
+            interface_luid: 42,
+        };
+        let desc = format!(
+            "[SRUM:Net] {} user:{} sent:{} recv:{}",
+            net.app_id, net.user_sid,
+            format_bytes(net.bytes_sent), format_bytes(net.bytes_received),
+        );
+        assert!(desc.contains("sent:10.0 GB"));
+        assert!(desc.contains("recv:1.0 GB"));
+    }
+
+    // ─── col() with multiple entries ────────────────────────────────────
+
+    #[test]
+    fn test_col_multiple_entries() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("appid".to_string(), 0);
+        map.insert("userid".to_string(), 1);
+        map.insert("timestamp".to_string(), 2);
+        map.insert("foregroundcycletime".to_string(), 3);
+        map.insert("backgroundcycletime".to_string(), 4);
+        map.insert("facetime".to_string(), 5);
+
+        assert_eq!(col(&map, "AppId"), Some(0));
+        assert_eq!(col(&map, "UserId"), Some(1));
+        assert_eq!(col(&map, "TIMESTAMP"), Some(2));
+        assert_eq!(col(&map, "ForegroundCycleTime"), Some(3));
+        assert_eq!(col(&map, "BackgroundCycleTime"), Some(4));
+        assert_eq!(col(&map, "FaceTime"), Some(5));
+        assert_eq!(col(&map, "nonexistent"), None);
+    }
+
+    // ─── parse_srum_from_ese error path ─────────────────────────────────
+
+    #[test]
+    fn test_parse_srum_from_ese_nonexistent_file() {
+        let result = parse_srum_from_ese("/totally/nonexistent/srudb.dat");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to open SRUM database"));
+    }
+
+    #[test]
+    fn test_parse_srum_from_ese_empty_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let result = parse_srum_from_ese(&tmp.path().to_string_lossy());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_srum_from_ese_garbage_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let garbage: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF].into_iter().cycle().take(400).collect();
+        tmp.write_all(&garbage).unwrap();
+        tmp.flush().unwrap();
+        let result = parse_srum_from_ese(&tmp.path().to_string_lossy());
+        assert!(result.is_err());
+    }
+
+    // ─── SrumNetworkEntry with zero interface_luid ──────────────────────
+
+    #[test]
+    fn test_srum_network_entry_interface_luid() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let entry = SrumNetworkEntry {
+            app_id: "test.exe".to_string(),
+            user_sid: "S-1-5-21-1234".to_string(),
+            timestamp: ts,
+            bytes_sent: 0,
+            bytes_received: 0,
+            interface_luid: 0x0600_0001_0000_0000,
+        };
+        assert_eq!(entry.interface_luid, 0x0600_0001_0000_0000);
+    }
+
+    // ─── SrumConnectivityEntry with large connected_time ────────────────
+
+    #[test]
+    fn test_srum_connectivity_entry_max_connected_time() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = SrumConnectivityEntry {
+            app_id: "svchost.exe".to_string(),
+            user_sid: "S-1-5-18".to_string(),
+            timestamp: ts,
+            connected_time: u32::MAX,
+            interface_luid: 0,
+        };
+        assert_eq!(entry.connected_time, u32::MAX);
+    }
+
+    // ─── GUID format verification ───────────────────────────────────────
+
+    #[test]
+    fn test_srum_guids_are_valid_uuid_format() {
+        // Check that GUIDs follow {8-4-4-4-12} format
+        fn is_valid_guid(s: &str) -> bool {
+            if !s.starts_with('{') || !s.ends_with('}') {
+                return false;
+            }
+            let inner = &s[1..s.len() - 1];
+            let parts: Vec<&str> = inner.split('-').collect();
+            parts.len() == 5
+                && parts[0].len() == 8
+                && parts[1].len() == 4
+                && parts[2].len() == 4
+                && parts[3].len() == 4
+                && parts[4].len() == 12
+        }
+
+        assert!(is_valid_guid(APP_RESOURCE_USAGE_TABLE), "Invalid GUID: {}", APP_RESOURCE_USAGE_TABLE);
+        assert!(is_valid_guid(NETWORK_DATA_USAGE_TABLE), "Invalid GUID: {}", NETWORK_DATA_USAGE_TABLE);
+        assert!(is_valid_guid(NETWORK_CONNECTIVITY_TABLE), "Invalid GUID: {}", NETWORK_CONNECTIVITY_TABLE);
+    }
+
+    // ─── Timeline entry creation from all three SRUM types ──────────────
+
+    #[test]
+    fn test_srum_app_timeline_entry_source() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_srum_id()),
+            path: "[SRUM:App] test.exe".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::Execute,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Srum],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert!(entry.sources.contains(&ArtifactSource::Srum));
+        assert_eq!(entry.event_type, EventType::Execute);
+    }
+
+    #[test]
+    fn test_srum_net_timeline_entry_source() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_srum_id()),
+            path: "[SRUM:Net] test.exe".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::NetworkConnection,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Srum],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert!(entry.sources.contains(&ArtifactSource::Srum));
+        assert_eq!(entry.event_type, EventType::NetworkConnection);
+    }
+
+    #[test]
+    fn test_srum_conn_timeline_entry_source() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 8, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_srum_id()),
+            path: "[SRUM:Conn] test.exe".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::NetworkConnection,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Srum],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert!(entry.sources.contains(&ArtifactSource::Srum));
+        assert_eq!(entry.event_type, EventType::NetworkConnection);
+    }
+
+    // ─── Multiple SRUM IDs are unique ───────────────────────────────────
+
+    #[test]
+    fn test_srum_ids_unique_across_many() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let id = next_srum_id();
+            assert!(ids.insert(id), "Duplicate ID: {}", id);
+        }
+        assert_eq!(ids.len(), 100);
+    }
+
+    // ─── resolve_id with all common ESE Value types ─────────────────────
+
+    #[test]
+    fn test_resolve_id_i64_returns_question() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::I64(99);
+        assert_eq!(resolve_id(&val, &map), "?");
+    }
+
+    #[test]
+    fn test_resolve_id_bool_returns_question() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::Bool(true);
+        assert_eq!(resolve_id(&val, &map), "?");
+    }
+
+    #[test]
+    fn test_resolve_id_f64_returns_question() {
+        let map = std::collections::HashMap::new();
+        let val = libesedb::Value::F64(3.14);
+        assert_eq!(resolve_id(&val, &map), "?");
+    }
 }

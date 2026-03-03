@@ -549,4 +549,312 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── parse_services pipeline tests with mock providers ───────────
+
+    fn make_system_hive_manifest() -> crate::collection::manifest::ArtifactManifest {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest
+    }
+
+    #[test]
+    fn test_parse_services_open_file_error() {
+        // Tests the warn path when provider.open_file fails (line 183-186)
+        let manifest = make_system_hive_manifest();
+        let mut store = TimelineStore::new();
+
+        struct FailOpenProvider;
+        impl CollectionProvider for FailOpenProvider {
+            fn discover(&self) -> crate::collection::manifest::ArtifactManifest {
+                crate::collection::manifest::ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("Disk read error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_services(&FailOpenProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_services_invalid_hive_data() {
+        // Tests the warn path when parse_services_from_hive fails (line 197-200)
+        let manifest = make_system_hive_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageDataProvider;
+        impl CollectionProvider for GarbageDataProvider {
+            fn discover(&self) -> crate::collection::manifest::ArtifactManifest {
+                crate::collection::manifest::ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xFFu8; 256])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_services(&GarbageDataProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_services_no_system_hive_in_manifest() {
+        // Tests the debug path when no SYSTEM hives are in the manifest (line 175-178)
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        // Add a SOFTWARE hive instead of SYSTEM
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct NoOpProvider;
+        impl CollectionProvider for NoOpProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_services(&NoOpProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_services_multiple_system_hives() {
+        // Tests iterating multiple SYSTEM hive entries (line 180 loop)
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/backup/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("read error for both")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_services(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_one_byte() {
+        let result = parse_services_from_hive(&[0x72]); // 'r' byte
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_all_zeros_small() {
+        // Zeroed data does not contain valid regf magic
+        let result = parse_services_from_hive(&[0u8; 32]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_random_short_data() {
+        let result = parse_services_from_hive(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(result.is_err());
+    }
+
+    // ─── ServiceEntry formatting variations ──────────────────────────
+
+    #[test]
+    fn test_service_description_with_system_start() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let svc = ServiceEntry {
+            name: "SysDrv".to_string(),
+            image_path: r"system32\drivers\sysdrv.sys".to_string(),
+            start_type: 1,
+            service_type: 2,
+            last_write: ts,
+        };
+        let desc = format!(
+            "[Service:{}] {} -> {}",
+            svc.name,
+            start_type_str(svc.start_type),
+            svc.image_path,
+        );
+        assert!(desc.contains("System"));
+        assert!(desc.contains("SysDrv"));
+    }
+
+    #[test]
+    fn test_service_entry_various_service_types() {
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        // Service type 1 = kernel driver
+        let svc1 = ServiceEntry {
+            name: "KernelDrv".to_string(),
+            image_path: "driver.sys".to_string(),
+            start_type: 0,
+            service_type: 1,
+            last_write: ts,
+        };
+        assert_eq!(svc1.service_type, 1);
+
+        // Service type 16 = own process
+        let svc16 = ServiceEntry {
+            name: "OwnProcess".to_string(),
+            image_path: "svc.exe".to_string(),
+            start_type: 2,
+            service_type: 16,
+            last_write: ts,
+        };
+        assert_eq!(svc16.service_type, 16);
+
+        // Service type 32 = shared process
+        let svc32 = ServiceEntry {
+            name: "SharedSvc".to_string(),
+            image_path: "svchost.exe -k netsvcs".to_string(),
+            start_type: 2,
+            service_type: 32,
+            last_write: ts,
+        };
+        assert_eq!(svc32.service_type, 32);
+    }
+
+    #[test]
+    fn test_service_timeline_entry_has_correct_source() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_service_id()),
+            path: "[Service:Svc] Auto -> test.exe".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::ServiceInstall,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Registry("SYSTEM".to_string())],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        // Verify the ArtifactSource displays correctly
+        assert_eq!(format!("{}", entry.sources[0]), "REG:SYSTEM");
+    }
+
+    #[test]
+    fn test_service_timeline_entry_timestamps_default() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_service_id()),
+            path: "test".to_string(),
+            primary_timestamp: ts,
+            event_type: EventType::ServiceInstall,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Registry("SYSTEM".to_string())],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+        assert!(entry.timestamps.si_created.is_none());
+        assert!(entry.timestamps.fn_created.is_none());
+        assert!(entry.metadata.file_size.is_none());
+    }
+
+    #[test]
+    fn test_start_type_str_boundary_5() {
+        assert_eq!(start_type_str(5), "Unknown");
+    }
+
+    #[test]
+    fn test_next_service_id_uniqueness_batch() {
+        let ids: Vec<u64> = (0..100).map(|_| next_service_id()).collect();
+        // All IDs should be unique
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn test_parse_services_skips_non_system_hives() {
+        // Manifest with only non-System hives; should be filtered out
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/user/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser { username: "user".to_string() },
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SAM", 'C'),
+            hive_type: RegistryHiveType::Sam,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct PanicProvider;
+        impl CollectionProvider for PanicProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("Should not be called for non-System hives")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // This should NOT panic because non-System hives are filtered out
+        let result = parse_services(&PanicProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
 }

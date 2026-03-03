@@ -371,4 +371,257 @@ mod tests {
         assert_eq!(cloned.filename, summary.filename);
         assert_eq!(cloned.file_size, summary.file_size);
     }
+
+    // ─── Tests targeting uncovered lines ─────────────────────────────────
+
+    #[test]
+    fn test_parse_rdp_cache_with_file_open_error() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Microsoft/Terminal Server Client/Cache/bcache0.bmc",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("Permission denied")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_rdp_cache(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_rdp_cache_with_too_small_file() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/Cache/bcache0.bmc",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct TinyProvider;
+        impl CollectionProvider for TinyProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Less than 16 bytes -> analyze_bmc_file returns None
+                Ok(vec![0u8; 8])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_rdp_cache(&TinyProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0); // None from analyze -> skipped
+    }
+
+    #[test]
+    fn test_parse_rdp_cache_with_valid_rdp8_file() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path(
+                "/Users/attacker/AppData/Local/Microsoft/Terminal Server Client/Cache/bcache0.bmc",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct Rdp8Provider;
+        impl CollectionProvider for Rdp8Provider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                let mut data = vec![0u8; 32768];
+                data[0..4].copy_from_slice(b"RDP8");
+                Ok(data)
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_rdp_cache(&Rdp8Provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+
+        let entry = store.get(0).unwrap();
+        assert!(entry.path.contains("[RDP:BitmapCache]"));
+        assert!(entry.path.contains("attacker"));
+        assert!(entry.path.contains("bcache0.bmc"));
+        assert!(entry.path.contains("RDP8+"));
+        assert!(matches!(entry.event_type, EventType::RdpSession));
+    }
+
+    #[test]
+    fn test_parse_rdp_cache_with_multiple_files() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path("/Users/admin/Cache/bcache0.bmc", 'C'),
+        );
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path("/Users/admin/Cache/bcache1.bmc", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct MultiProvider;
+        impl CollectionProvider for MultiProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                let mut data = vec![0u8; 32768];
+                data[0..4].copy_from_slice(b"RDP6");
+                Ok(data)
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_rdp_cache(&MultiProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn test_analyze_bmc_exactly_128_bytes() {
+        // data.len() = 128, which is NOT > 128, so estimated_tiles = 0, max(1) = 1
+        let data = vec![0u8; 128];
+        let summary = analyze_bmc_file(&data, "test.bmc").unwrap();
+        assert_eq!(summary.tile_count, 1);
+    }
+
+    #[test]
+    fn test_extract_username_multiple_users_segments() {
+        // Path with "Users" appearing in multiple places
+        let path = r"D:\Users\first_user\Users\second_user\Cache\bcache.bmc";
+        // Should return the first match: "first_user"
+        assert_eq!(extract_username_from_path(path), "first_user");
+    }
+
+    #[test]
+    fn test_extract_filename_only_separators() {
+        assert_eq!(extract_filename(r"\"), "");
+        assert_eq!(extract_filename("/"), "");
+    }
+
+    #[test]
+    fn test_analyze_bmc_rdp8_small_file() {
+        // Valid RDP8 header but only 16 bytes total (below 128 threshold for tile estimation)
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(b"RDP8");
+        let summary = analyze_bmc_file(&data, r"C:\Users\test\Cache\bcache.bmc").unwrap();
+        assert_eq!(summary.version, "RDP8+");
+        assert_eq!(summary.tile_count, 1); // max(0, 1) = 1
+        assert_eq!(summary.username, "test");
+    }
+
+    #[test]
+    fn test_analyze_bmc_rdp6_large_file() {
+        let mut data = vec![0u8; 327680]; // 20 tiles
+        data[0..4].copy_from_slice(b"RDP6");
+        let summary = analyze_bmc_file(&data, "bcache.bmc").unwrap();
+        assert_eq!(summary.version, "RDP6");
+        assert_eq!(summary.tile_count, 20);
+    }
+
+    #[test]
+    fn test_rdpcache_id_counter_has_rc_prefix() {
+        let id = next_rdpcache_id();
+        assert_eq!((id >> 48) & 0xFFFF, 0x5243);
+    }
+
+    #[test]
+    fn test_parse_rdp_cache_mixed_success_and_failure() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path("/Users/admin/Cache/bcache0.bmc", 'C'),
+        );
+        manifest.rdp_bitmap_cache.push(
+            NormalizedPath::from_image_path("/Users/admin/Cache/bcache1.bmc", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+        struct AlternatingProvider;
+        impl CollectionProvider for AlternatingProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                let count = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count % 2 == 0 {
+                    anyhow::bail!("Simulated failure")
+                } else {
+                    let mut data = vec![0u8; 32768];
+                    data[0..4].copy_from_slice(b"RDP8");
+                    Ok(data)
+                }
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_rdp_cache(&AlternatingProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // First file fails, second succeeds
+        assert_eq!(store.len(), 1);
+    }
 }

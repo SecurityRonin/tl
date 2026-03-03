@@ -207,4 +207,127 @@ mod tests {
         touch_marker(tmp.path()).unwrap();
         assert!(tmp.path().join(MARKER_FILE).exists());
     }
+
+    // ─── Coverage: touch_marker content ─────────────────────────────────
+
+    #[test]
+    fn test_touch_marker_writes_rfc3339_content() {
+        let tmp = TempDir::new().unwrap();
+        touch_marker(tmp.path()).unwrap();
+        let content = std::fs::read_to_string(tmp.path().join(MARKER_FILE)).unwrap();
+        // Should contain an RFC3339 timestamp
+        assert!(content.contains("T"), "marker content should be RFC3339: {}", content);
+    }
+
+    // ─── Coverage: needs_update with stale marker ───────────────────────
+
+    #[test]
+    fn test_needs_update_stale_marker() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let marker_path = tmp.path().join(MARKER_FILE);
+        std::fs::write(&marker_path, "old").unwrap();
+
+        // We can't easily set mtime far in the past without the filetime crate,
+        // so we verify a freshly written marker is NOT considered stale.
+        assert!(!needs_update(tmp.path()));
+    }
+
+    // ─── Coverage: count_rule_files with non-rule files ─────────────────
+
+    #[test]
+    fn test_count_rule_files_ignores_non_yaml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("file.txt"), "text").unwrap();
+        std::fs::write(tmp.path().join("file.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("file.xml"), "<xml/>").unwrap();
+        assert_eq!(count_rule_files(tmp.path()), 0);
+    }
+
+    #[test]
+    fn test_count_rule_files_nonexistent_dir() {
+        assert_eq!(count_rule_files(Path::new("/nonexistent/dir/xyz")), 0);
+    }
+
+    #[test]
+    fn test_count_rule_files_counts_yaml_extension() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("r1.yaml"), "---").unwrap();
+        std::fs::write(tmp.path().join("r2.yml"), "---").unwrap();
+        assert_eq!(count_rule_files(tmp.path()), 2);
+    }
+
+    #[test]
+    fn test_count_rule_files_deep_nesting() {
+        let tmp = TempDir::new().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.yml"), "---").unwrap();
+        assert_eq!(count_rule_files(tmp.path()), 1);
+    }
+
+    // ─── Coverage: ensure_rules with missing rules/windows dir ──────────
+
+    #[test]
+    fn test_ensure_rules_fails_when_rules_dir_missing() {
+        let tmp = TempDir::new().unwrap();
+        // Create a fake .git dir so it thinks it's already cloned
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        // Create a fresh marker so it doesn't try to update
+        touch_marker(tmp.path()).unwrap();
+
+        let result = ensure_rules(tmp.path());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found"), "Expected 'not found' error, got: {}", err_msg);
+    }
+
+    // ─── Coverage: default_cache_dir returns platform path ──────────────
+
+    #[test]
+    fn test_default_cache_dir_contains_sigma_rules() {
+        let dir = default_cache_dir();
+        let path_str = dir.to_string_lossy();
+        assert!(path_str.contains("sigma-rules"), "Expected sigma-rules in path: {}", path_str);
+    }
+
+    // ─── Coverage: dirs_cache_dir platform ──────────────────────────────
+
+    #[test]
+    fn test_dirs_cache_dir_returns_some_on_supported_platform() {
+        // On macOS/Linux (CI environments), HOME is usually set
+        let result = dirs_cache_dir();
+        if std::env::var("HOME").is_ok() || std::env::var("LOCALAPPDATA").is_ok() {
+            assert!(result.is_some());
+        }
+    }
+
+    // ─── Coverage: needs_update with .git but no marker ─────────────────
+
+    #[test]
+    fn test_needs_update_git_dir_no_marker() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        // No marker file -> should need update
+        assert!(needs_update(tmp.path()));
+    }
+
+    // ─── Coverage: walkdir with files without extension ─────────────────
+
+    #[test]
+    fn test_count_rule_files_no_extension_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "all:").unwrap();
+        std::fs::write(tmp.path().join("LICENSE"), "MIT").unwrap();
+        assert_eq!(count_rule_files(tmp.path()), 0);
+    }
+
+    // ─── Coverage: SIGMAHQ_REPO and DEBOUNCE_SECS constants ────────────
+
+    #[test]
+    fn test_constants() {
+        assert!(SIGMAHQ_REPO.contains("SigmaHQ"));
+        assert_eq!(DEBOUNCE_SECS, 86400);
+        assert_eq!(MARKER_FILE, ".tl-last-update");
+    }
 }

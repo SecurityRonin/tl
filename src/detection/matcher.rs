@@ -513,4 +513,265 @@ detection:
         let event: HashMap<String, String> = HashMap::new();
         assert!(!matches_rule(&rule, &event));
     }
+
+    // ─── Coverage: regex modifier ───────────────────────────────────────
+
+    #[test]
+    fn test_match_re_modifier() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: high
+logsource:
+    product: windows
+detection:
+    selection:
+        CommandLine|re: '^cmd\.exe.*\/c'
+    condition: selection
+"#).unwrap();
+
+        assert!(matches_rule(&rule, &make_event(&[("CommandLine", "cmd.exe /c whoami")])));
+        assert!(!matches_rule(&rule, &make_event(&[("CommandLine", "powershell.exe")])));
+    }
+
+    #[test]
+    fn test_match_re_modifier_invalid_regex_returns_false() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: high
+logsource:
+    product: windows
+detection:
+    selection:
+        CommandLine|re: '[invalid('
+    condition: selection
+"#).unwrap();
+
+        // Invalid regex should return false, not panic
+        assert!(!matches_rule(&rule, &make_event(&[("CommandLine", "anything")])));
+    }
+
+    // ─── Coverage: parenthesized condition expressions ──────────────────
+
+    #[test]
+    fn test_condition_with_parentheses() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: medium
+logsource:
+    product: windows
+detection:
+    sel1:
+        EventID: 4688
+    sel2:
+        EventID: 1
+    filter:
+        User: SYSTEM
+    condition: (sel1 or sel2) and not filter
+"#).unwrap();
+
+        // Matches sel1, not filtered
+        assert!(matches_rule(&rule, &make_event(&[
+            ("EventID", "4688"),
+            ("User", "admin"),
+        ])));
+        // Matches sel2, not filtered
+        assert!(matches_rule(&rule, &make_event(&[
+            ("EventID", "1"),
+            ("User", "admin"),
+        ])));
+        // Matches sel1 but filtered
+        assert!(!matches_rule(&rule, &make_event(&[
+            ("EventID", "4688"),
+            ("User", "SYSTEM"),
+        ])));
+        // Matches neither sel1 nor sel2
+        assert!(!matches_rule(&rule, &make_event(&[
+            ("EventID", "7045"),
+            ("User", "admin"),
+        ])));
+    }
+
+    // ─── Coverage: unknown selection name returns false ──────────────────
+
+    #[test]
+    fn test_condition_unknown_selection_returns_false() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 1
+    condition: nonexistent_selection
+"#).unwrap();
+
+        assert!(!matches_rule(&rule, &make_event(&[("EventID", "1")])));
+    }
+
+    // ─── Coverage: complex OR condition ─────────────────────────────────
+
+    #[test]
+    fn test_condition_chained_or() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    sel1:
+        EventID: 1
+    sel2:
+        EventID: 2
+    sel3:
+        EventID: 3
+    condition: sel1 or sel2 or sel3
+"#).unwrap();
+
+        assert!(matches_rule(&rule, &make_event(&[("EventID", "1")])));
+        assert!(matches_rule(&rule, &make_event(&[("EventID", "2")])));
+        assert!(matches_rule(&rule, &make_event(&[("EventID", "3")])));
+        assert!(!matches_rule(&rule, &make_event(&[("EventID", "4")])));
+    }
+
+    // ─── Coverage: chained AND condition ────────────────────────────────
+
+    #[test]
+    fn test_condition_chained_and() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: high
+logsource:
+    product: windows
+detection:
+    sel1:
+        EventID: 4688
+    sel2:
+        Channel: Security
+    sel3:
+        Computer: WORKSTATION1
+    condition: sel1 and sel2 and sel3
+"#).unwrap();
+
+        assert!(matches_rule(&rule, &make_event(&[
+            ("EventID", "4688"),
+            ("Channel", "Security"),
+            ("Computer", "WORKSTATION1"),
+        ])));
+        // Missing one field
+        assert!(!matches_rule(&rule, &make_event(&[
+            ("EventID", "4688"),
+            ("Channel", "Security"),
+        ])));
+    }
+
+    // ─── Coverage: tokenizer edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_tokenizer_empty_condition() {
+        // An empty condition should tokenize to nothing, evaluating to false
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 1
+    condition: ""
+"#);
+        // This may fail at parse time or evaluate to false
+        // Either outcome is acceptable
+        if let Ok(rule) = rule {
+            assert!(!matches_rule(&rule, &make_event(&[("EventID", "1")])));
+        }
+    }
+
+    // ─── Coverage: endswith case insensitive ─────────────────────────────
+
+    #[test]
+    fn test_endswith_case_insensitive() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: medium
+logsource:
+    product: windows
+detection:
+    selection:
+        Image|endswith: '.EXE'
+    condition: selection
+"#).unwrap();
+
+        assert!(matches_rule(&rule, &make_event(&[("Image", "C:\\temp\\evil.exe")])));
+        assert!(matches_rule(&rule, &make_event(&[("Image", "C:\\temp\\EVIL.EXE")])));
+    }
+
+    // ─── Coverage: startswith case insensitive ───────────────────────────
+
+    #[test]
+    fn test_startswith_case_insensitive() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: medium
+logsource:
+    product: windows
+detection:
+    selection:
+        Image|startswith: 'c:\windows'
+    condition: selection
+"#).unwrap();
+
+        assert!(matches_rule(&rule, &make_event(&[("Image", "C:\\Windows\\System32\\cmd.exe")])));
+    }
+
+    // ─── Coverage: exact match case insensitive ─────────────────────────
+
+    #[test]
+    fn test_exact_match_case_insensitive() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection:
+        Channel: security
+    condition: selection
+"#).unwrap();
+
+        assert!(matches_rule(&rule, &make_event(&[("Channel", "Security")])));
+        assert!(matches_rule(&rule, &make_event(&[("Channel", "SECURITY")])));
+    }
+
+    // ─── Coverage: NOT applied to primary (not-only) ────────────────────
+
+    #[test]
+    fn test_not_primary_standalone() {
+        let rule = SigmaRule::from_yaml(r#"
+title: test
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    filter:
+        EventID: 1
+    condition: not filter
+"#).unwrap();
+
+        // Event does NOT match filter -> "not filter" = true
+        assert!(matches_rule(&rule, &make_event(&[("EventID", "999")])));
+        // Event matches filter -> "not filter" = false
+        assert!(!matches_rule(&rule, &make_event(&[("EventID", "1")])));
+    }
 }

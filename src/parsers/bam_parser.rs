@@ -627,4 +627,211 @@ mod tests {
         let result = parse_bam_timestamp(&data);
         assert_eq!(result, Some(dt));
     }
+
+    // ─── Pipeline integration and hive parsing coverage ──────────────────
+
+    #[test]
+    fn test_parse_bam_from_hive_invalid_data() {
+        // Invalid hive data should return an error
+        let result = parse_bam_from_hive(&[0u8; 100]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bam_from_hive_empty_data() {
+        let result = parse_bam_from_hive(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bam_from_hive_truncated_hive() {
+        // A buffer that starts with "regf" but is too short
+        let mut data = vec![0u8; 50];
+        data[0..4].copy_from_slice(b"regf");
+        let result = parse_bam_from_hive(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bam_with_system_hive_that_fails_to_open() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // Should succeed (error is logged, not propagated)
+        let result = parse_bam(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_bam_with_system_hive_invalid_content() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Return garbage data that won't parse as a registry hive
+                Ok(vec![0xDE, 0xAD, 0xBE, 0xEF].into_iter().cycle().take(1024).collect())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // Should succeed (parse error is logged, not propagated)
+        let result = parse_bam(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_bam_skips_non_system_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        // Add an NTUSER.DAT hive (not SYSTEM) - should be skipped
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+        // Add a Software hive - should be skipped
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct PanicProvider;
+        impl CollectionProvider for PanicProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("Should not be called for non-SYSTEM hives")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // Should succeed without calling open_file because no SYSTEM hives
+        let result = parse_bam(&PanicProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_bam_with_multiple_system_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        // Two system hives - both should be attempted
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM.bak", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        use std::sync::atomic::AtomicU32;
+        static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+        struct CountingProvider;
+        impl CollectionProvider for CountingProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Return invalid data so parsing fails gracefully
+                Ok(vec![0u8; 512])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let result = parse_bam(&CountingProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Both hives should have been attempted
+        assert_eq!(CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_parse_bam_timestamp_1_byte() {
+        let data = vec![0xFF];
+        assert!(parse_bam_timestamp(&data).is_none());
+    }
+
+    #[test]
+    fn test_device_path_case_sensitivity() {
+        // The prefix match is case-sensitive
+        let path = r"\device\harddiskvolume3\Windows\cmd.exe";
+        let result = device_path_to_windows_path(path);
+        // Lowercase "device" doesn't match, returned as-is
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn test_device_path_just_prefix() {
+        let path = r"\Device\HarddiskVolume";
+        let result = device_path_to_windows_path(path);
+        // After strip_prefix, rest is "" which has no backslash
+        assert_eq!(result, path);
+    }
 }

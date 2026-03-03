@@ -1258,4 +1258,669 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Tests targeting uncovered lines ─────────────────────────────────
+
+    // ─── parse_win10_fallback tests ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_win10_fallback_with_entries() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let path = r"C:\Windows\fallback.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        // Build data with unknown magic, but embed "10ts" entries starting at 0x30
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // unknown magic
+
+        // Entry with "10ts" signature
+        data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes()); // sig
+        data.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        let entry_size = 12 + 2 + path_bytes.len() + 8 + 4;
+        data.extend_from_slice(&(entry_size as u32).to_le_bytes()); // cache entry size
+        data.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes()); // path len
+        data.extend_from_slice(&path_bytes); // path
+        data.extend_from_slice(&ft.to_le_bytes()); // timestamp
+        data.extend_from_slice(&0u32.to_le_bytes()); // data_size
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].last_modified, Some(dt));
+    }
+
+    #[test]
+    fn test_parse_win10_fallback_no_entries_found() {
+        // Unknown magic, no "10ts" signatures -> fallback parser fails
+        let mut data = vec![0u8; 0x60];
+        data[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let result = parse_appcompat_cache(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_win10_fallback_skips_invalid_path_len() {
+        // Entry with path_len that would go beyond data
+        let mut data = vec![0u8; 0x40];
+        data[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // unknown magic
+
+        // Pad to 0x30
+        data.resize(0x30, 0);
+
+        // Place a "10ts" signature at offset 0x30
+        data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes()); // offset 0x30
+        data.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        data.extend_from_slice(&100u32.to_le_bytes()); // cache entry size
+        // path_len = 5000, way too large
+        data.extend_from_slice(&5000u16.to_le_bytes());
+        // Not enough data after for path
+
+        let result = parse_appcompat_cache(&data);
+        assert!(result.is_err()); // fallback finds no valid entries
+    }
+
+    #[test]
+    fn test_parse_win10_fallback_empty_path_skipped() {
+        // Fallback entry with 0-byte path
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // unknown magic
+
+        // "10ts" entry with path_len = 0
+        data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&26u32.to_le_bytes()); // cache entry size
+        data.extend_from_slice(&0u16.to_le_bytes()); // path_len = 0
+        data.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        data.extend_from_slice(&0u32.to_le_bytes()); // data_size
+
+        let result = parse_appcompat_cache(&data);
+        assert!(result.is_err()); // empty path skipped, no valid entries
+    }
+
+    #[test]
+    fn test_parse_win10_fallback_multiple_entries() {
+        use chrono::TimeZone;
+        let dt1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let dt2 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let ft = |d: DateTime<Utc>| -> u64 {
+            ((d.timestamp() + 11_644_473_600) as u64) * 10_000_000
+        };
+
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        for (path, filetime) in &[
+            (r"C:\app1.exe", ft(dt1)),
+            (r"C:\app2.exe", ft(dt2)),
+        ] {
+            let path_bytes: Vec<u8> = path
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect();
+            data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            let entry_size = 12 + 2 + path_bytes.len() + 8 + 4;
+            data.extend_from_slice(&(entry_size as u32).to_le_bytes());
+            data.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+            data.extend_from_slice(&path_bytes);
+            data.extend_from_slice(&filetime.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+        }
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, r"C:\app1.exe");
+        assert_eq!(entries[1].path, r"C:\app2.exe");
+    }
+
+    // ─── parse_win7 with actual entries ──────────────────────────────────
+
+    #[test]
+    fn test_parse_win7_64bit_single_entry() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2020, 6, 15, 10, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let path = r"C:\Windows\win7app.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        let num_entries = 1u32;
+        let header_size = 0x80usize;
+        let entry_size = 0x30usize; // 64-bit
+
+        // Total data: header + entries + path data
+        let path_data_offset = header_size + num_entries as usize * entry_size;
+        let total_size = path_data_offset + path_bytes.len();
+        let mut data = vec![0u8; total_size];
+
+        // Header
+        data[0..4].copy_from_slice(&WIN7_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&num_entries.to_le_bytes());
+
+        // Entry at header_size:
+        let eo = header_size;
+        // path_len (u16) at eo
+        data[eo..eo + 2].copy_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        // max_path_len (u16) at eo+2
+        data[eo + 2..eo + 4].copy_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        // Padding (4 bytes) at eo+4
+        // Path offset (u64) at eo+8 -> points to path_data_offset
+        data[eo + 8..eo + 16].copy_from_slice(&(path_data_offset as u64).to_le_bytes());
+        // Timestamp (u64) at eo+16
+        data[eo + 16..eo + 24].copy_from_slice(&ft.to_le_bytes());
+
+        // Path data
+        data[path_data_offset..path_data_offset + path_bytes.len()]
+            .copy_from_slice(&path_bytes);
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].last_modified, Some(dt));
+    }
+
+    #[test]
+    fn test_parse_win7_32bit_single_entry() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2015, 3, 1, 8, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let num_entries = 1u32;
+        let header_size = 0x80usize;
+        let entry_size_32 = 0x20usize;
+        let entry_size_64 = 0x30usize;
+
+        // We need: header + 1*0x30 > data.len() (fails 64-bit check)
+        //    but:  header + 1*0x20 <= data.len() (passes 32-bit check)
+        // header = 0x80 = 128, entry_64 = 0x30 = 48 -> 128+48 = 176
+        // header + entry_32 = 128+32 = 160
+        // So total_size must be in [160, 175].
+        // path_data_offset = 128+32 = 160, path needs to fit there
+        let path_data_offset = header_size + num_entries as usize * entry_size_32; // 160
+        // Total size = 160 + path_bytes.len(). We need total < 176.
+        // path_bytes.len() for "C:\Windows\win7_32.exe" = 22 chars * 2 = 44
+        // 160 + 44 = 204 > 176, so this won't work with path data at end.
+        // Instead, place path data inside the entry region or overlap.
+        // Better approach: use exactly 175 bytes and put path offset inside existing space.
+        let total_size = 175; // 128+48-1 = forces 32-bit mode
+        assert!(header_size + num_entries as usize * entry_size_64 > total_size);
+        assert!(header_size + num_entries as usize * entry_size_32 <= total_size);
+
+        let mut data = vec![0u8; total_size];
+        data[0..4].copy_from_slice(&WIN7_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&num_entries.to_le_bytes());
+
+        // 32-bit entry at header_size:
+        // path_len (u16) at eo
+        // max_path_len (u16) at eo+2
+        // path_offset (u32) at eo+4
+        // timestamp (u64) at eo+8
+        let eo = header_size;
+
+        // Use a very short path: "C:" = 2 chars * 2 bytes = 4 bytes
+        let short_path = r"C:";
+        let short_path_bytes: Vec<u8> = short_path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        data[eo..eo + 2].copy_from_slice(&(short_path_bytes.len() as u16).to_le_bytes());
+        data[eo + 2..eo + 4].copy_from_slice(&(short_path_bytes.len() as u16).to_le_bytes());
+        // Place path data after the entry: offset = 160
+        data[eo + 4..eo + 8].copy_from_slice(&(path_data_offset as u32).to_le_bytes());
+        data[eo + 8..eo + 16].copy_from_slice(&ft.to_le_bytes());
+
+        data[path_data_offset..path_data_offset + short_path_bytes.len()]
+            .copy_from_slice(&short_path_bytes);
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "C:");
+        assert_eq!(entries[0].last_modified, Some(dt));
+    }
+
+    #[test]
+    fn test_parse_win7_entry_with_zero_path_len() {
+        let num_entries = 1u32;
+        let header_size = 0x80usize;
+        let entry_size = 0x30usize;
+        let total_size = header_size + num_entries as usize * entry_size + 64;
+        let mut data = vec![0u8; total_size];
+
+        data[0..4].copy_from_slice(&WIN7_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&num_entries.to_le_bytes());
+
+        // path_len = 0 -> path won't be extracted
+        // (data already zeroed)
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        // Entry with 0 path_len -> path_ptr + path_len check fails or empty path
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_win7_entry_path_ptr_beyond_data() {
+        let num_entries = 1u32;
+        let header_size = 0x80usize;
+        let entry_size = 0x30usize;
+        let total_size = header_size + num_entries as usize * entry_size;
+        let mut data = vec![0u8; total_size];
+
+        data[0..4].copy_from_slice(&WIN7_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&num_entries.to_le_bytes());
+
+        let eo = header_size;
+        data[eo..eo + 2].copy_from_slice(&20u16.to_le_bytes()); // path_len = 20
+        data[eo + 2..eo + 4].copy_from_slice(&20u16.to_le_bytes());
+        // 64-bit path pointer pointing way beyond data
+        data[eo + 8..eo + 16].copy_from_slice(&50000u64.to_le_bytes());
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0); // path beyond data, skipped
+    }
+
+    // ─── parse_win8 additional tests ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_win8_multiple_entries() {
+        use chrono::TimeZone;
+        let dt1 = Utc.with_ymd_and_hms(2015, 1, 1, 0, 0, 0).unwrap();
+        let dt2 = Utc.with_ymd_and_hms(2015, 6, 1, 0, 0, 0).unwrap();
+        let ft = |d: DateTime<Utc>| -> u64 {
+            ((d.timestamp() + 11_644_473_600) as u64) * 10_000_000
+        };
+
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN8_HEADER_MAGIC.to_le_bytes());
+
+        for (path_str, filetime) in &[
+            (r"C:\Windows\app1.exe", ft(dt1)),
+            (r"C:\Windows\app2.exe", ft(dt2)),
+        ] {
+            let path_bytes: Vec<u8> = path_str
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect();
+            data.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes()); // path_len
+            data.extend_from_slice(&path_bytes); // path
+            data.extend_from_slice(&0u32.to_le_bytes()); // insertion flags
+            data.extend_from_slice(&0u32.to_le_bytes()); // shim flags
+            data.extend_from_slice(&filetime.to_le_bytes()); // timestamp
+            data.extend_from_slice(&0u32.to_le_bytes()); // data_size
+        }
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, r"C:\Windows\app1.exe");
+        assert_eq!(entries[1].path, r"C:\Windows\app2.exe");
+    }
+
+    #[test]
+    fn test_parse_win8_path_beyond_data() {
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN8_HEADER_MAGIC.to_le_bytes());
+
+        // path_len = 5000, but buffer won't have that much data
+        data.extend_from_slice(&5000u32.to_le_bytes());
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0); // path extends beyond -> break
+    }
+
+    #[test]
+    fn test_parse_win8_empty_path_skipped() {
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN8_HEADER_MAGIC.to_le_bytes());
+
+        // Entry with path that decodes to empty (all NUL UTF-16)
+        let null_path = vec![0u8; 4]; // 2 UTF-16 NUL chars
+        data.extend_from_slice(&(null_path.len() as u32).to_le_bytes());
+        data.extend_from_slice(&null_path);
+        data.extend_from_slice(&0u32.to_le_bytes()); // insertion
+        data.extend_from_slice(&0u32.to_le_bytes()); // shim
+        data.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        data.extend_from_slice(&0u32.to_le_bytes()); // data_size
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0); // empty path skipped
+    }
+
+    #[test]
+    fn test_parse_win8_with_data_payload() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2015, 1, 1, 0, 0, 0).unwrap();
+        let ft = ((dt.timestamp() + 11_644_473_600) as u64) * 10_000_000;
+
+        let path = r"C:\test.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        let mut data = vec![0u8; 0x80];
+        data[0..4].copy_from_slice(&WIN8_HEADER_MAGIC.to_le_bytes());
+
+        data.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+        data.extend_from_slice(&path_bytes);
+        data.extend_from_slice(&0u32.to_le_bytes()); // insertion flags
+        data.extend_from_slice(&0u32.to_le_bytes()); // shim flags
+        data.extend_from_slice(&ft.to_le_bytes()); // timestamp
+        data.extend_from_slice(&8u32.to_le_bytes()); // data_size = 8
+        data.extend_from_slice(&[0xAA; 8]); // data payload
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+    }
+
+    // ─── parse_winxp additional tests ────────────────────────────────────
+
+    #[test]
+    fn test_parse_winxp_multiple_entries() {
+        use chrono::TimeZone;
+        let dt1 = Utc.with_ymd_and_hms(2005, 1, 1, 0, 0, 0).unwrap();
+        let dt2 = Utc.with_ymd_and_hms(2005, 6, 1, 0, 0, 0).unwrap();
+        let ft = |d: DateTime<Utc>| -> u64 {
+            ((d.timestamp() + 11_644_473_600) as u64) * 10_000_000
+        };
+
+        let num_entries = 2u32;
+        let header_size = 0x190usize;
+        let entry_size = 0x228usize;
+        let mut data = vec![0u8; header_size + num_entries as usize * entry_size];
+
+        data[0..4].copy_from_slice(&WINXP_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&num_entries.to_le_bytes());
+
+        for (i, (path_str, filetime)) in [
+            (r"C:\WINDOWS\notepad.exe", ft(dt1)),
+            (r"C:\WINDOWS\calc.exe", ft(dt2)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path_bytes: Vec<u8> = path_str
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect();
+            let entry_offset = header_size + i * entry_size;
+            data[entry_offset..entry_offset + path_bytes.len()].copy_from_slice(&path_bytes);
+            let ts_offset = entry_offset + 528;
+            data[ts_offset..ts_offset + 8].copy_from_slice(&filetime.to_le_bytes());
+        }
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, r"C:\WINDOWS\notepad.exe");
+        assert_eq!(entries[1].path, r"C:\WINDOWS\calc.exe");
+    }
+
+    #[test]
+    fn test_parse_winxp_entry_beyond_data() {
+        // Claim 5 entries but only provide space for 1
+        let header_size = 0x190usize;
+        let entry_size = 0x228usize;
+        let mut data = vec![0u8; header_size + entry_size]; // room for 1 entry
+
+        data[0..4].copy_from_slice(&WINXP_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&5u32.to_le_bytes()); // claim 5 entries
+
+        // Write one valid entry
+        let path = r"C:\WINDOWS\test.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data[header_size..header_size + path_bytes.len()].copy_from_slice(&path_bytes);
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1); // Only 1 fits
+    }
+
+    #[test]
+    fn test_parse_winxp_empty_path_skipped() {
+        let header_size = 0x190usize;
+        let entry_size = 0x228usize;
+        let mut data = vec![0u8; header_size + entry_size];
+
+        data[0..4].copy_from_slice(&WINXP_HEADER_MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // Path area is all zeros -> empty UTF-16 -> skipped
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    // ─── parse_win10 edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_win10_path_extends_beyond_data() {
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+
+        // Entry signature
+        data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        data.extend_from_slice(&100u32.to_le_bytes()); // cache entry size
+        // path_len = 5000, way beyond remaining data
+        data.extend_from_slice(&5000u16.to_le_bytes());
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0); // path beyond data -> break
+    }
+
+    #[test]
+    fn test_parse_win10_entry_with_data_payload() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let ft = (secs as u64) * 10_000_000;
+
+        let path = r"C:\with_data.exe";
+        let path_bytes: Vec<u8> = path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        let mut buf = vec![0u8; 0x30];
+        buf[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+
+        buf.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let data_payload = [0xBB; 16];
+        let entry_size = 12 + 2 + path_bytes.len() + 8 + 4 + data_payload.len();
+        buf.extend_from_slice(&(entry_size as u32).to_le_bytes());
+        buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&path_bytes);
+        buf.extend_from_slice(&ft.to_le_bytes());
+        buf.extend_from_slice(&(data_payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&data_payload);
+
+        let entries = parse_appcompat_cache(&buf).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, path);
+    }
+
+    #[test]
+    fn test_parse_win10_broken_entry_sig_stops_parsing() {
+        // First entry valid, second has wrong sig -> stops at second
+        let mut data = build_test_win10_cache(&[(r"C:\first.exe", 0)]);
+        // Append garbage where the next entry sig would be
+        data.extend_from_slice(&[0xFF; 20]);
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, r"C:\first.exe");
+    }
+
+    #[test]
+    fn test_parse_win10_header_shorter_than_0x34() {
+        // Data less than 0x34 bytes but has Win10 magic -> header_size = 0x30
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        // No entries
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    // ─── parse_shimcache main function tests ─────────────────────────────
+
+    #[test]
+    fn test_parse_shimcache_with_system_hive_open_error() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_shimcache(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_shimcache_with_invalid_hive_data() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xDE; 256])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_shimcache(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_shimcache_skips_non_system_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/test/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser { username: "test".to_string() },
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct NeverCalledProvider;
+        impl CollectionProvider for NeverCalledProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("open_file should not be called for non-SYSTEM hives");
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_shimcache(&NeverCalledProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_decode_utf16le_invalid_surrogate() {
+        // Unpaired surrogate (0xD800) should produce replacement character
+        let data = [0x00, 0xD8]; // lone high surrogate
+        let result = decode_utf16le(&data);
+        assert!(result.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_parse_win10_cache_entry_size_field_none() {
+        // Entry where read_u32_le at offset+8 fails (not enough data)
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+
+        // Entry sig at 0x30 but only 10 bytes of entry data (need >= 12 for size)
+        data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes()); // 4
+        data.extend_from_slice(&0u32.to_le_bytes()); // 4 = 8 total
+        // 2 more bytes only (need 4 for cache_entry_size)
+        data.extend_from_slice(&[0u8; 2]);
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0); // breaks on None from read_u32_le
+    }
+
+    #[test]
+    fn test_parse_win10_path_len_none() {
+        // Entry where read_u16_le for path_len fails
+        let mut data = vec![0u8; 0x30];
+        data[0..4].copy_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+
+        // Full first 12 bytes of entry
+        data.extend_from_slice(&WIN10_HEADER_MAGIC.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&100u32.to_le_bytes());
+        // Only 1 byte for path_len (need 2)
+        data.extend_from_slice(&[0u8; 1]);
+
+        let entries = parse_appcompat_cache(&data).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
 }

@@ -684,4 +684,176 @@ mod tests {
         assert_eq!(task.command, "notepad.exe");
         assert!(task.arguments.is_none());
     }
+
+    // ─── Coverage for parse_scheduled_tasks pipeline ────────────────────
+
+    #[test]
+    fn test_parse_scheduled_tasks_with_valid_xml() {
+        use crate::collection::path::NormalizedPath;
+
+        let xml_data = basic_task_xml().as_bytes().to_vec();
+
+        struct TaskProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for TaskProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = TaskProvider { data: xml_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.scheduled_tasks.push(NormalizedPath::from_image_path("/Windows/System32/Tasks/SuspTask", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_scheduled_tasks(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+        let entry = store.get(0).unwrap();
+        assert_eq!(entry.event_type, EventType::ScheduledTaskCreate);
+        assert!(entry.path.contains("[SchedTask]"));
+        assert!(entry.path.contains("backdoor.exe"));
+        assert!(entry.sources.contains(&ArtifactSource::ScheduledTask));
+    }
+
+    #[test]
+    fn test_parse_scheduled_tasks_provider_fails() {
+        use crate::collection::path::NormalizedPath;
+
+        struct FailTaskProvider;
+        impl CollectionProvider for FailTaskProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("disk error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.scheduled_tasks.push(NormalizedPath::from_image_path("/Windows/System32/Tasks/Test", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_scheduled_tasks(&FailTaskProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_scheduled_tasks_invalid_xml() {
+        use crate::collection::path::NormalizedPath;
+
+        struct InvalidXmlProvider;
+        impl CollectionProvider for InvalidXmlProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(b"not valid xml at all".to_vec())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.scheduled_tasks.push(NormalizedPath::from_image_path("/Tasks/Bad", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_scheduled_tasks(&InvalidXmlProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_scheduled_tasks_utf16le_encoded() {
+        use crate::collection::path::NormalizedPath;
+
+        let xml_str = basic_task_xml();
+        let mut utf16le_data: Vec<u8> = vec![0xFF, 0xFE]; // BOM
+        for c in xml_str.encode_utf16() {
+            utf16le_data.extend_from_slice(&c.to_le_bytes());
+        }
+
+        struct Utf16Provider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for Utf16Provider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = Utf16Provider { data: utf16le_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.scheduled_tasks.push(NormalizedPath::from_image_path("/Tasks/Utf16Task", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_scheduled_tasks(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_task_date_invalid_fractional() {
+        // Fractional with exactly 6 digits (no truncation needed)
+        let dt = parse_task_date("2025-06-15T10:30:00.123456");
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn test_decode_task_xml_short_data() {
+        // Data shorter than 2 bytes
+        let data = [0x41u8];
+        let result = decode_task_xml(&data);
+        assert_eq!(result, "A");
+    }
+
+    #[test]
+    fn test_decode_task_xml_empty() {
+        let data: &[u8] = &[];
+        let result = decode_task_xml(data);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_parse_task_date_fractional_5_digits() {
+        let dt = parse_task_date("2025-06-15T10:30:00.12345");
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn test_parse_task_xml_com_handler_with_no_arguments() {
+        let task = parse_task_xml(task_with_com_handler_xml()).unwrap();
+        // ComHandler tasks don't have arguments
+        assert!(task.arguments.is_none());
+    }
 }

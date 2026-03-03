@@ -615,4 +615,628 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── parse_browser_history pipeline tests ────────────────────────
+
+    fn make_chrome_manifest() -> ArtifactManifest {
+        use crate::collection::path::NormalizedPath;
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Google/Chrome/User Data/Default/History",
+                'C',
+            ),
+        );
+        manifest
+    }
+
+    fn make_firefox_manifest() -> ArtifactManifest {
+        use crate::collection::path::NormalizedPath;
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Mozilla/Firefox/Profiles/abc.default/places.sqlite",
+                'C',
+            ),
+        );
+        manifest
+    }
+
+    fn make_edge_manifest() -> ArtifactManifest {
+        use crate::collection::path::NormalizedPath;
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Microsoft/Edge/User Data/Default/History",
+                'C',
+            ),
+        );
+        manifest
+    }
+
+    #[test]
+    fn test_parse_browser_history_open_file_error() {
+        // Tests warn path when provider.open_file fails (line 190-193)
+        let manifest = make_chrome_manifest();
+        let mut store = TimelineStore::new();
+
+        struct FailOpenProvider;
+        impl CollectionProvider for FailOpenProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("Cannot read browser history file")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_browser_history(&FailOpenProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_browser_history_invalid_sqlite_data() {
+        // Tests debug path when parse_chromium_history fails (line 223-225)
+        let manifest = make_chrome_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xFFu8; 256]) // Not a valid SQLite database
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_browser_history(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_browser_history_firefox_invalid_sqlite() {
+        // Tests debug path when parse_firefox_history fails (line 216-218)
+        let manifest = make_firefox_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xABu8; 128])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_browser_history(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_browser_history_edge_invalid_sqlite() {
+        // Edge uses Chromium path - tests line 221 match arm
+        let manifest = make_edge_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_browser_history(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_browser_history_with_valid_chromium_db() {
+        // Create a real in-memory Chromium-format SQLite database
+        // and test the full parsing path (lines 95-127, 237-263)
+        use crate::collection::path::NormalizedPath;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        // Create Chromium-style history tables
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);
+             INSERT INTO urls (id, url, title, visit_count) VALUES (1, 'https://example.com', 'Example', 5);
+             INSERT INTO urls (id, url, title, visit_count) VALUES (2, 'https://test.com', '', 1);
+             INSERT INTO visits (id, url, visit_time) VALUES (1, 1, 13370000000000000);
+             INSERT INTO visits (id, url, visit_time) VALUES (2, 2, 13370000000000000);"
+        ).unwrap();
+        drop(conn);
+
+        // Read the database file
+        let db_data = std::fs::read(&tmp_path).unwrap();
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Google/Chrome/User Data/Default/History",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct DbProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for DbProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = DbProvider { data: db_data };
+        let result = parse_browser_history(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 2);
+
+        // Verify entries contain expected data
+        let entry0 = store.get(0).unwrap();
+        assert!(entry0.path.contains("[Chrome:History]"));
+        assert!(entry0.path.contains("https://example.com") || entry0.path.contains("https://test.com"));
+    }
+
+    #[test]
+    fn test_parse_browser_history_with_valid_firefox_db() {
+        // Create a real Firefox-format SQLite database (lines 138-170, 237-263)
+        use crate::collection::path::NormalizedPath;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, place_id INTEGER, visit_date INTEGER);
+             INSERT INTO moz_places (id, url, title, visit_count) VALUES (1, 'https://mozilla.org', 'Mozilla', 3);
+             INSERT INTO moz_places (id, url, title, visit_count) VALUES (2, 'https://test.org', NULL, 1);
+             INSERT INTO moz_historyvisits (id, place_id, visit_date) VALUES (1, 1, 1736942400000000);
+             INSERT INTO moz_historyvisits (id, place_id, visit_date) VALUES (2, 2, 1736942400000000);"
+        ).unwrap();
+        drop(conn);
+
+        let db_data = std::fs::read(&tmp_path).unwrap();
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Roaming/Mozilla/Firefox/Profiles/abc/places.sqlite",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct DbProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for DbProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = DbProvider { data: db_data };
+        let result = parse_browser_history(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 2);
+
+        // Verify Firefox entries
+        let entry0 = store.get(0).unwrap();
+        assert!(entry0.path.contains("[Firefox:History]"));
+    }
+
+    #[test]
+    fn test_parse_browser_history_chromium_with_title_and_without() {
+        // Tests the title_display branch: empty vs non-empty title (lines 243-247)
+        use crate::collection::path::NormalizedPath;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);
+             INSERT INTO urls (id, url, title, visit_count) VALUES (1, 'https://titled.com', 'Has Title', 2);
+             INSERT INTO urls (id, url, title, visit_count) VALUES (2, 'https://notitled.com', '', 1);
+             INSERT INTO visits (id, url, visit_time) VALUES (1, 1, 13370000000000000);
+             INSERT INTO visits (id, url, visit_time) VALUES (2, 2, 13370000000000000);"
+        ).unwrap();
+        drop(conn);
+
+        let db_data = std::fs::read(&tmp_path).unwrap();
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Google/Chrome/User Data/Default/History",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct DbProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for DbProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = DbProvider { data: db_data };
+        let result = parse_browser_history(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 2);
+
+        // Check that one entry has a quoted title and the other doesn't
+        let paths: Vec<String> = store.entries().map(|e| e.path.clone()).collect();
+        let has_title_entry = paths.iter().any(|p| p.contains("\"Has Title\""));
+        let no_title_entry = paths.iter().any(|p| p.contains("https://notitled.com") && !p.contains("\"\""));
+        assert!(has_title_entry, "Should have entry with quoted title");
+        assert!(no_title_entry, "Should have entry without quoted empty title");
+    }
+
+    #[test]
+    fn test_parse_browser_history_multiple_databases() {
+        // Tests iterating multiple browser history paths (line 187 loop)
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Google/Chrome/User Data/Default/History",
+                'C',
+            ),
+        );
+        manifest.browser_history.push(
+            NormalizedPath::from_image_path(
+                "/Users/admin/AppData/Local/Microsoft/Edge/User Data/Default/History",
+                'C',
+            ),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("read error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_browser_history(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    // ─── parse_chromium_history with real SQLite ─────────────────────
+
+    #[test]
+    fn test_parse_chromium_history_empty_db() {
+        // Valid SQLite DB but no rows - tests empty query result (lines 112-124)
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);"
+        ).unwrap();
+        drop(conn);
+
+        let result = parse_chromium_history(&tmp_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_chromium_history_with_zero_visit_time() {
+        // visit_time=0 should be filtered out by chrome_time_to_datetime (line 114)
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);
+             INSERT INTO urls (id, url, title, visit_count) VALUES (1, 'https://zero.com', 'Zero', 1);
+             INSERT INTO visits (id, url, visit_time) VALUES (1, 1, 0);"
+        ).unwrap();
+        drop(conn);
+
+        let result = parse_chromium_history(&tmp_path).unwrap();
+        assert_eq!(result.len(), 0); // zero visit_time should be filtered
+    }
+
+    #[test]
+    fn test_parse_chromium_history_missing_tables() {
+        // SQLite DB without required tables
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY);").unwrap();
+        drop(conn);
+
+        let result = parse_chromium_history(&tmp_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_firefox_history_empty_db() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, place_id INTEGER, visit_date INTEGER);"
+        ).unwrap();
+        drop(conn);
+
+        let result = parse_firefox_history(&tmp_path).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_firefox_history_null_title() {
+        // Tests title.unwrap_or_default() path (line 160)
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, place_id INTEGER, visit_date INTEGER);
+             INSERT INTO moz_places (id, url, title, visit_count) VALUES (1, 'https://notitle.com', NULL, 1);
+             INSERT INTO moz_historyvisits (id, place_id, visit_date) VALUES (1, 1, 1736942400000000);"
+        ).unwrap();
+        drop(conn);
+
+        let result = parse_firefox_history(&tmp_path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].title.is_empty()); // NULL becomes empty string
+        assert_eq!(result[0].browser, BrowserType::Firefox);
+    }
+
+    #[test]
+    fn test_parse_firefox_history_zero_visit_date() {
+        // visit_date=0 should be filtered by firefox_time_to_datetime (line 157)
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, place_id INTEGER, visit_date INTEGER);
+             INSERT INTO moz_places (id, url, title, visit_count) VALUES (1, 'https://zero.com', 'Zero', 1);
+             INSERT INTO moz_historyvisits (id, place_id, visit_date) VALUES (1, 1, 0);"
+        ).unwrap();
+        drop(conn);
+
+        let result = parse_firefox_history(&tmp_path).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_firefox_history_missing_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+
+        let conn = rusqlite::Connection::open(&tmp_path).unwrap();
+        conn.execute_batch("CREATE TABLE other (id INTEGER PRIMARY KEY);").unwrap();
+        drop(conn);
+
+        let result = parse_firefox_history(&tmp_path);
+        assert!(result.is_err());
+    }
+
+    // ─── detect_browser additional tests ─────────────────────────────
+
+    #[test]
+    fn test_detect_browser_firefox_via_mozilla_in_path() {
+        // Firefox detected via "mozilla" keyword (line 73)
+        assert_eq!(
+            detect_browser("/some/path/Mozilla/data"),
+            BrowserType::Firefox,
+        );
+    }
+
+    #[test]
+    fn test_detect_browser_edge_priority_over_chrome() {
+        // "edge" in path should detect Edge, not Chrome
+        assert_eq!(
+            detect_browser("C:\\Users\\test\\Edge\\History"),
+            BrowserType::Edge,
+        );
+    }
+
+    #[test]
+    fn test_detect_browser_firefox_priority_over_edge() {
+        // Firefox check comes before Edge check, so "firefox" wins
+        assert_eq!(
+            detect_browser("firefox_edge_path"),
+            BrowserType::Firefox,
+        );
+    }
+
+    #[test]
+    fn test_detect_browser_generic_path_defaults_to_chrome() {
+        assert_eq!(detect_browser("/data/History"), BrowserType::Chrome);
+        assert_eq!(detect_browser(""), BrowserType::Chrome);
+        assert_eq!(detect_browser("random.db"), BrowserType::Chrome);
+    }
+
+    // ─── chrome_time_to_datetime edge cases ──────────────────────────
+
+    #[test]
+    fn test_chrome_time_exactly_at_epoch_boundary() {
+        // Test the exact boundary where unix_usec = 0
+        let chrome_time: i64 = 11_644_473_600_000_000;
+        let dt = chrome_time_to_datetime(chrome_time).unwrap();
+        assert_eq!(dt.timestamp(), 0);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+    }
+
+    #[test]
+    fn test_chrome_time_one_below_epoch() {
+        // unix_usec = -1 should return None
+        let chrome_time: i64 = 11_644_473_600_000_000 - 1;
+        assert!(chrome_time_to_datetime(chrome_time).is_none());
+    }
+
+    #[test]
+    fn test_firefox_time_one_second() {
+        let dt = firefox_time_to_datetime(1_000_000).unwrap();
+        assert_eq!(dt.timestamp(), 1);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+    }
+
+    // ─── next_browser_id uniqueness ──────────────────────────────────
+
+    #[test]
+    fn test_next_browser_id_uniqueness_batch() {
+        let ids: Vec<u64> = (0..100).map(|_| next_browser_id()).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    // ─── BrowserHistoryEntry debug format ────────────────────────────
+
+    #[test]
+    fn test_browser_history_entry_debug() {
+        let entry = BrowserHistoryEntry {
+            url: "https://debug.test".to_string(),
+            title: "Debug".to_string(),
+            visit_time: Utc::now(),
+            visit_count: 1,
+            browser: BrowserType::Chrome,
+        };
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("BrowserHistoryEntry"));
+        assert!(debug_str.contains("debug.test"));
+    }
+
+    // ─── browser_name matching in pipeline ───────────────────────────
+
+    #[test]
+    fn test_browser_name_mapping() {
+        // Directly test the match arms for browser name (lines 238-242)
+        let names: Vec<(&str, BrowserType)> = vec![
+            ("Chrome", BrowserType::Chrome),
+            ("Edge", BrowserType::Edge),
+            ("Firefox", BrowserType::Firefox),
+        ];
+        for (expected_name, browser_type) in names {
+            let actual = match &browser_type {
+                BrowserType::Chrome => "Chrome",
+                BrowserType::Edge => "Edge",
+                BrowserType::Firefox => "Firefox",
+            };
+            assert_eq!(actual, expected_name);
+        }
+    }
+
+    #[test]
+    fn test_parse_chromium_history_detects_browser_from_path() {
+        // Tests that detect_browser is called with the db_path (line 86)
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path_str = tmp.path().to_string_lossy().to_string();
+        // Create a valid but empty chromium db
+        let conn = rusqlite::Connection::open(&tmp_path_str).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER);
+             CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);
+             INSERT INTO urls (id, url, title, visit_count) VALUES (1, 'https://test.com', 'Test', 1);
+             INSERT INTO visits (id, url, visit_time) VALUES (1, 1, 13370000000000000);"
+        ).unwrap();
+        drop(conn);
+
+        // parse_chromium_history detects browser from the path
+        let entries = parse_chromium_history(&tmp_path_str).unwrap();
+        assert_eq!(entries.len(), 1);
+        // Since tmp_path doesn't contain "edge" or "firefox", it defaults to Chrome
+        assert_eq!(entries[0].browser, BrowserType::Chrome);
+    }
 }

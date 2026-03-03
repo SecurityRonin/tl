@@ -828,4 +828,245 @@ mod tests {
         };
         assert!(matches!(entry.sources[0], ArtifactSource::UserAssist));
     }
+
+    // ─── Tests targeting uncovered lines in parse_userassist_from_hive ────
+
+    #[test]
+    fn test_parse_userassist_from_hive_invalid_data() {
+        // Passing garbage data should fail to parse as a registry hive
+        let data = vec![0xFFu8; 256];
+        let result = parse_userassist_from_hive(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_userassist_from_hive_empty_data() {
+        let result = parse_userassist_from_hive(&[]);
+        assert!(result.is_err());
+    }
+
+    // ─── Tests targeting uncovered lines in parse_userassist (main fn) ───
+
+    #[test]
+    fn test_parse_userassist_with_ntuser_hive_open_error() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/test/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser { username: "test".to_string() },
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // The provider fails to open the file, should warn and continue
+        let result = parse_userassist(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_userassist_with_invalid_hive_data() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/test/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser { username: "test".to_string() },
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Return garbage data that won't parse as a valid hive
+                Ok(vec![0xDE; 64])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // The hive is unparseable, should warn and continue
+        let result = parse_userassist(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_userassist_skips_non_ntuser_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        // Add a SYSTEM hive, not NTUSER - should be filtered out
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct NeverCalledProvider;
+        impl CollectionProvider for NeverCalledProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("open_file should not be called for non-NTUSER hives");
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        // Only NTUSER hives are processed; SYSTEM and SOFTWARE are skipped
+        let result = parse_userassist(&NeverCalledProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_userassist_value_winxp_with_zero_timestamp() {
+        // WinXP format with zero timestamp in FILETIME field
+        let mut data = vec![0u8; 16];
+        data[4..8].copy_from_slice(&3u32.to_le_bytes());
+        // Timestamp bytes all zero -> filetime_to_datetime returns None
+        let result = parse_userassist_value(&data);
+        assert!(result.is_some());
+        let (run_count, focus_count, focus_time, last_run) = result.unwrap();
+        assert_eq!(run_count, 3);
+        assert!(focus_count.is_none());
+        assert!(focus_time.is_none());
+        assert!(last_run.is_none());
+    }
+
+    #[test]
+    fn test_parse_userassist_value_win7_large_values() {
+        let mut data = vec![0u8; 72];
+        data[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        data[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let result = parse_userassist_value(&data);
+        assert!(result.is_some());
+        let (run_count, focus_count, focus_time, _) = result.unwrap();
+        assert_eq!(run_count, u32::MAX);
+        assert_eq!(focus_count, Some(u32::MAX));
+        assert_eq!(focus_time, Some(u32::MAX));
+    }
+
+    #[test]
+    fn test_read_u32_le_offset_at_exact_boundary() {
+        // Data has exactly 4 bytes at offset 2 -> should succeed
+        let data = [0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+        assert_eq!(read_u32_le(&data, 2), Some(0x04030201));
+        // Offset 3 leaves only 3 bytes -> should fail
+        assert!(read_u32_le(&data, 3).is_none());
+    }
+
+    #[test]
+    fn test_read_u64_le_offset_at_exact_boundary() {
+        let data = [0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        assert_eq!(read_u64_le(&data, 2), Some(0x0807060504030201));
+        // Offset 3 leaves only 7 bytes -> should fail
+        assert!(read_u64_le(&data, 3).is_none());
+    }
+
+    #[test]
+    fn test_filetime_very_large_value() {
+        // Very large filetime that's still valid (far future)
+        let filetime: u64 = 200_000_000_000_000_000; // year ~2434
+        let result = filetime_to_datetime(filetime);
+        assert!(result.is_some());
+        let dt = result.unwrap();
+        assert!(dt.timestamp() > 0);
+    }
+
+    #[test]
+    fn test_parse_userassist_value_exactly_71_bytes() {
+        // 71 bytes: less than WIN7 min (72) but more than WINXP (16) -> WinXP format
+        let mut data = vec![0u8; 71];
+        data[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let result = parse_userassist_value(&data);
+        assert!(result.is_some());
+        let (run_count, focus_count, focus_time, _) = result.unwrap();
+        assert_eq!(run_count, 2);
+        assert!(focus_count.is_none());
+        assert!(focus_time.is_none());
+    }
+
+    #[test]
+    fn test_parse_userassist_value_exactly_72_bytes() {
+        // Exactly 72 -> WIN7 format
+        let mut data = vec![0u8; 72];
+        data[4..8].copy_from_slice(&10u32.to_le_bytes());
+        data[8..12].copy_from_slice(&5u32.to_le_bytes());
+        data[12..16].copy_from_slice(&3000u32.to_le_bytes());
+        let result = parse_userassist_value(&data);
+        assert!(result.is_some());
+        let (run_count, focus_count, focus_time, _) = result.unwrap();
+        assert_eq!(run_count, 10);
+        assert_eq!(focus_count, Some(5));
+        assert_eq!(focus_time, Some(3000));
+    }
+
+    #[test]
+    fn test_rot13_full_alphabet_roundtrip() {
+        let original = "The Quick Brown Fox Jumps Over The Lazy Dog 0123456789!@#";
+        let encoded = rot13(original);
+        let decoded = rot13(&encoded);
+        assert_eq!(decoded, original);
+        // Encoded should differ from original (at least for alpha chars)
+        assert_ne!(encoded, original);
+    }
+
+    #[test]
+    fn test_userassist_entry_with_none_fields() {
+        let entry = UserAssistEntry {
+            path: "path_only".to_string(),
+            run_count: 0,
+            focus_count: None,
+            focus_time_ms: None,
+            last_run_time: None,
+            guid: String::new(),
+        };
+        assert_eq!(entry.path, "path_only");
+        assert_eq!(entry.run_count, 0);
+        assert!(entry.focus_count.is_none());
+        assert!(entry.focus_time_ms.is_none());
+        assert!(entry.last_run_time.is_none());
+        assert!(entry.guid.is_empty());
+    }
 }

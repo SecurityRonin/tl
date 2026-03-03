@@ -604,4 +604,371 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── parse_network_history pipeline tests ────────────────────────
+
+    fn make_software_manifest() -> ArtifactManifest {
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+        manifest
+    }
+
+    #[test]
+    fn test_parse_network_history_open_file_error() {
+        // Tests warn path when provider.open_file fails (line 187-190)
+        let manifest = make_software_manifest();
+        let mut store = TimelineStore::new();
+
+        struct FailOpenProvider;
+        impl CollectionProvider for FailOpenProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("Cannot read SOFTWARE hive")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_network_history(&FailOpenProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_network_history_invalid_hive_data() {
+        // Tests debug path when parse_network_profiles fails (line 237)
+        let manifest = make_software_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xFFu8; 512])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_network_history(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_network_history_multiple_software_hives() {
+        // Tests iterating multiple SOFTWARE hive entries
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/backup/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("read error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_network_history(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_network_history_skips_non_software_hives() {
+        use crate::collection::manifest::{RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        // Only System hive - should be filtered out by the Software filter
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct PanicProvider;
+        impl CollectionProvider for PanicProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("Should not be called for non-Software hive")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_network_history(&PanicProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    // ─── parse_systemtime additional edge cases ──────────────────────
+
+    #[test]
+    fn test_parse_systemtime_invalid_date() {
+        // Month 13 is invalid
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&13u16.to_le_bytes()); // invalid month
+        data[6..8].copy_from_slice(&15u16.to_le_bytes());
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_invalid_day_32() {
+        // Day 32 is invalid for any month
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&32u16.to_le_bytes()); // invalid day
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_invalid_hour_25() {
+        // Hour 25 is invalid
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&1u16.to_le_bytes());
+        data[8..10].copy_from_slice(&25u16.to_le_bytes()); // invalid hour
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_leap_year_feb_29() {
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2024u16.to_le_bytes()); // 2024 is a leap year
+        data[2..4].copy_from_slice(&2u16.to_le_bytes());
+        data[6..8].copy_from_slice(&29u16.to_le_bytes());
+        data[8..10].copy_from_slice(&12u16.to_le_bytes());
+        let dt = parse_systemtime(&data).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2024-02-29");
+    }
+
+    #[test]
+    fn test_parse_systemtime_non_leap_year_feb_29() {
+        // 2025 is not a leap year, Feb 29 should fail
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&2u16.to_le_bytes());
+        data[6..8].copy_from_slice(&29u16.to_le_bytes());
+        assert!(parse_systemtime(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_systemtime_end_of_day() {
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&2025u16.to_le_bytes());
+        data[2..4].copy_from_slice(&12u16.to_le_bytes());
+        data[6..8].copy_from_slice(&31u16.to_le_bytes());
+        data[8..10].copy_from_slice(&23u16.to_le_bytes());
+        data[10..12].copy_from_slice(&59u16.to_le_bytes());
+        data[12..14].copy_from_slice(&59u16.to_le_bytes());
+        let dt = parse_systemtime(&data).unwrap();
+        assert_eq!(dt.format("%H:%M:%S").to_string(), "23:59:59");
+    }
+
+    #[test]
+    fn test_parse_systemtime_year_1601() {
+        // Windows FILETIME epoch
+        let mut data = [0u8; 16];
+        data[0..2].copy_from_slice(&1601u16.to_le_bytes());
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let dt = parse_systemtime(&data);
+        // NaiveDate should support year 1601
+        assert!(dt.is_some());
+    }
+
+    // ─── NetworkProfileEntry description format tests ────────────────
+
+    #[test]
+    fn test_network_profile_first_and_last_connect_descriptions() {
+        let now = Utc::now();
+        let profile = NetworkProfileEntry {
+            profile_name: "Home WiFi".to_string(),
+            description: "My Home Network".to_string(),
+            dns_suffix: "home.local".to_string(),
+            first_connected: Some(now),
+            last_connected: Some(now),
+            network_type: 71,
+            managed: false,
+        };
+
+        let first_desc = format!(
+            "[NetProfile:FirstConnect] {} ({}, DNS: {})",
+            profile.profile_name,
+            network_type_str(profile.network_type),
+            profile.dns_suffix
+        );
+        assert!(first_desc.contains("Home WiFi"));
+        assert!(first_desc.contains("Wireless"));
+        assert!(first_desc.contains("home.local"));
+
+        let last_desc = format!(
+            "[NetProfile:LastConnect] {} ({}, DNS: {})",
+            profile.profile_name,
+            network_type_str(profile.network_type),
+            profile.dns_suffix
+        );
+        assert!(last_desc.contains("LastConnect"));
+    }
+
+    #[test]
+    fn test_network_profile_empty_dns_suffix() {
+        let profile = NetworkProfileEntry {
+            profile_name: "OpenWiFi".to_string(),
+            description: String::new(),
+            dns_suffix: String::new(),
+            first_connected: Some(Utc::now()),
+            last_connected: None,
+            network_type: 71,
+            managed: false,
+        };
+        let desc = format!(
+            "[NetProfile:FirstConnect] {} ({}, DNS: {})",
+            profile.profile_name,
+            network_type_str(profile.network_type),
+            profile.dns_suffix
+        );
+        assert!(desc.contains("DNS: "));
+        assert!(desc.contains("OpenWiFi"));
+    }
+
+    #[test]
+    fn test_network_profile_unknown_type() {
+        let profile = NetworkProfileEntry {
+            profile_name: "Mystery".to_string(),
+            description: String::new(),
+            dns_suffix: String::new(),
+            first_connected: Some(Utc::now()),
+            last_connected: None,
+            network_type: 42,
+            managed: false,
+        };
+        let desc = format!(
+            "[NetProfile:FirstConnect] {} ({}, DNS: {})",
+            profile.profile_name,
+            network_type_str(profile.network_type),
+            profile.dns_suffix
+        );
+        assert!(desc.contains("Unknown"));
+    }
+
+    #[test]
+    fn test_next_netlist_id_uniqueness_batch() {
+        let ids: Vec<u64> = (0..100).map(|_| next_netlist_id()).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn test_parse_network_profiles_short_zeroed_data() {
+        // Short zeroed data without valid regf header should error
+        let data = vec![0u8; 32];
+        let result = parse_network_profiles(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_network_profiles_short_random_data() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let result = parse_network_profiles(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_network_profile_all_fields_populated() {
+        let now = Utc::now();
+        let entry = NetworkProfileEntry {
+            profile_name: "FullProfile".to_string(),
+            description: "Full description".to_string(),
+            dns_suffix: "corp.example.com".to_string(),
+            first_connected: Some(now),
+            last_connected: Some(now),
+            network_type: 6,
+            managed: true,
+        };
+        assert_eq!(entry.profile_name, "FullProfile");
+        assert_eq!(entry.description, "Full description");
+        assert_eq!(entry.dns_suffix, "corp.example.com");
+        assert!(entry.first_connected.is_some());
+        assert!(entry.last_connected.is_some());
+        assert_eq!(network_type_str(entry.network_type), "Wired");
+        assert!(entry.managed);
+    }
+
+    #[test]
+    fn test_network_type_str_boundary_values() {
+        assert_eq!(network_type_str(5), "Unknown");
+        assert_eq!(network_type_str(7), "Unknown");
+        assert_eq!(network_type_str(22), "Unknown");
+        assert_eq!(network_type_str(24), "Unknown");
+        assert_eq!(network_type_str(70), "Unknown");
+        assert_eq!(network_type_str(72), "Unknown");
+    }
+
+    #[test]
+    fn test_network_signatures_key_value() {
+        assert_eq!(
+            NETWORK_SIGNATURES_KEY,
+            r"Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures"
+        );
+    }
+
+    #[test]
+    fn test_network_profiles_key_value() {
+        assert_eq!(
+            NETWORK_PROFILES_KEY,
+            r"Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles"
+        );
+    }
 }

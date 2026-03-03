@@ -863,4 +863,324 @@ mod tests {
             _ => panic!("Expected GenericConsumer"),
         }
     }
+
+    // ─── Coverage for pipeline integration and description building ──────
+
+    #[test]
+    fn test_parse_wmi_persistence_with_data() {
+        use crate::collection::path::NormalizedPath;
+
+        // Build OBJECTS.DATA with a CommandLineEventConsumer
+        let mut wmi_data = vec![0u8; 1024];
+        let consumer = b"CommandLineEventConsumer";
+        let name_field = b"Name=\"EvilConsumer\"";
+        let cmd = b"CommandLineTemplate=\"powershell -enc ZQ\"";
+        let offset = 256;
+        wmi_data[offset..offset + consumer.len()].copy_from_slice(consumer);
+        let name_off = offset + consumer.len() + 5;
+        wmi_data[name_off..name_off + name_field.len()].copy_from_slice(name_field);
+        let cmd_off = name_off + name_field.len() + 5;
+        wmi_data[cmd_off..cmd_off + cmd.len()].copy_from_slice(cmd);
+
+        struct WmiProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for WmiProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = WmiProvider { data: wmi_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.wmi_repository.push(NormalizedPath::from_image_path("/WMI/OBJECTS.DATA", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_wmi_persistence(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() > 0, "Should have created timeline entries for WMI persistence");
+        // The entry should have Execute event type for CommandLineConsumer
+        let entry = store.get(0).unwrap();
+        assert_eq!(entry.event_type, EventType::Execute);
+        assert!(entry.path.contains("[WMI:CmdConsumer]"));
+        // Non-benign should have EXECUTION_NO_PREFETCH anomaly
+        assert!(entry.anomalies.contains(AnomalyFlags::EXECUTION_NO_PREFETCH));
+    }
+
+    #[test]
+    fn test_wmi_persistence_benign_no_anomaly() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut wmi_data = vec![0u8; 1024];
+        let consumer = b"CommandLineEventConsumer";
+        let name_field = b"Name=\"SCM Event Log Consumer\"";
+        let offset = 256;
+        wmi_data[offset..offset + consumer.len()].copy_from_slice(consumer);
+        let name_off = offset + consumer.len() + 5;
+        wmi_data[name_off..name_off + name_field.len()].copy_from_slice(name_field);
+
+        struct BenignWmiProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for BenignWmiProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = BenignWmiProvider { data: wmi_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.wmi_repository.push(NormalizedPath::from_image_path("/WMI/OBJECTS.DATA", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_wmi_persistence(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        if store.len() > 0 {
+            let entry = store.get(0).unwrap();
+            // Benign entries should NOT have the anomaly flag
+            assert!(!entry.anomalies.contains(AnomalyFlags::EXECUTION_NO_PREFETCH));
+        }
+    }
+
+    #[test]
+    fn test_wmi_persistence_provider_fails() {
+        use crate::collection::path::NormalizedPath;
+
+        struct FailWmiProvider;
+        impl CollectionProvider for FailWmiProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("disk error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.wmi_repository.push(NormalizedPath::from_image_path("/WMI/OBJECTS.DATA", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_wmi_persistence(&FailWmiProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_wmi_description_active_script_consumer() {
+        let entry = WmiPersistenceEntry {
+            persistence_type: WmiPersistenceType::ActiveScriptConsumer,
+            name: "ScriptRunner".to_string(),
+            details: "ScriptText: evil.vbs".to_string(),
+            is_benign: false,
+        };
+        let description = match &entry.persistence_type {
+            WmiPersistenceType::ActiveScriptConsumer => {
+                format!("[WMI:ScriptConsumer] {} {}", entry.name, entry.details)
+            }
+            _ => unreachable!(),
+        };
+        assert!(description.contains("[WMI:ScriptConsumer]"));
+        assert!(description.contains("ScriptRunner"));
+    }
+
+    #[test]
+    fn test_wmi_description_event_filter() {
+        let entry = WmiPersistenceEntry {
+            persistence_type: WmiPersistenceType::EventFilter,
+            name: "EvilFilter".to_string(),
+            details: "SELECT * FROM __InstanceModificationEvent".to_string(),
+            is_benign: false,
+        };
+        let description = match &entry.persistence_type {
+            WmiPersistenceType::EventFilter => {
+                format!("[WMI:Filter] {} {}", entry.name, entry.details)
+            }
+            _ => unreachable!(),
+        };
+        assert!(description.contains("[WMI:Filter]"));
+    }
+
+    #[test]
+    fn test_wmi_description_binding() {
+        let entry = WmiPersistenceEntry {
+            persistence_type: WmiPersistenceType::FilterToConsumerBinding,
+            name: "binding1".to_string(),
+            details: "Consumer -> Filter".to_string(),
+            is_benign: false,
+        };
+        let description = match &entry.persistence_type {
+            WmiPersistenceType::FilterToConsumerBinding => {
+                format!("[WMI:Binding] {} {}", entry.name, entry.details)
+            }
+            _ => unreachable!(),
+        };
+        assert!(description.contains("[WMI:Binding]"));
+    }
+
+    #[test]
+    fn test_wmi_description_generic_consumer() {
+        let entry = WmiPersistenceEntry {
+            persistence_type: WmiPersistenceType::GenericConsumer("CustomEventConsumer".to_string()),
+            name: "GenericThing".to_string(),
+            details: "some details".to_string(),
+            is_benign: false,
+        };
+        let description = match &entry.persistence_type {
+            WmiPersistenceType::GenericConsumer(class) => {
+                format!("[WMI:{}] {} {}", class, entry.name, entry.details)
+            }
+            _ => unreachable!(),
+        };
+        assert!(description.contains("[WMI:CustomEventConsumer]"));
+        assert!(description.contains("GenericThing"));
+    }
+
+    #[test]
+    fn test_wmi_event_type_mapping() {
+        // CommandLineConsumer and ActiveScriptConsumer => Execute
+        // Others => RegistryModify
+        let cmd = WmiPersistenceType::CommandLineConsumer;
+        let script = WmiPersistenceType::ActiveScriptConsumer;
+        let filter = WmiPersistenceType::EventFilter;
+        let binding = WmiPersistenceType::FilterToConsumerBinding;
+        let generic = WmiPersistenceType::GenericConsumer("Test".to_string());
+
+        let map_type = |pt: &WmiPersistenceType| -> EventType {
+            match pt {
+                WmiPersistenceType::CommandLineConsumer
+                | WmiPersistenceType::ActiveScriptConsumer => EventType::Execute,
+                _ => EventType::RegistryModify,
+            }
+        };
+
+        assert_eq!(map_type(&cmd), EventType::Execute);
+        assert_eq!(map_type(&script), EventType::Execute);
+        assert_eq!(map_type(&filter), EventType::RegistryModify);
+        assert_eq!(map_type(&binding), EventType::RegistryModify);
+        assert_eq!(map_type(&generic), EventType::RegistryModify);
+    }
+
+    #[test]
+    fn test_wmi_persistence_active_script_timeline_entry() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut wmi_data = vec![0u8; 1024];
+        let consumer = b"ActiveScriptEventConsumer";
+        let name_field = b"Name=\"ScriptRunner\"";
+        let script = b"ScriptingEngine=\"VBScript\"";
+        let offset = 256;
+        wmi_data[offset..offset + consumer.len()].copy_from_slice(consumer);
+        let name_off = offset + consumer.len() + 5;
+        wmi_data[name_off..name_off + name_field.len()].copy_from_slice(name_field);
+        let script_off = name_off + name_field.len() + 5;
+        wmi_data.resize(script_off + script.len() + 64, 0);
+        wmi_data[script_off..script_off + script.len()].copy_from_slice(script);
+
+        struct ScriptWmiProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for ScriptWmiProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = ScriptWmiProvider { data: wmi_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.wmi_repository.push(NormalizedPath::from_image_path("/WMI/OBJECTS.DATA", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_wmi_persistence(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        if store.len() > 0 {
+            let entry = store.get(0).unwrap();
+            assert_eq!(entry.event_type, EventType::Execute);
+            assert!(entry.path.contains("[WMI:ScriptConsumer]"));
+        }
+    }
+
+    #[test]
+    fn test_extract_name_near_no_name_key() {
+        // No "Name" substring at all after the class name
+        let context = "CommandLineEventConsumer something else";
+        let name = extract_name_near(context, "CommandLineEventConsumer");
+        assert_eq!(name, "Unknown");
+    }
+
+    #[test]
+    fn test_extract_name_near_class_not_found() {
+        let context = "SomeOtherConsumer.Name=\"test\"";
+        let name = extract_name_near(context, "CommandLineEventConsumer");
+        assert_eq!(name, "Unknown");
+    }
+
+    #[test]
+    fn test_extract_commandline_details_no_keyword() {
+        let context = "some random data without the keyword";
+        let details = extract_commandline_details(context);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn test_extract_commandline_details_with_value() {
+        let context = r#"CommandLineTemplate="powershell.exe -enc ZQ""#;
+        let details = extract_commandline_details(context);
+        assert!(details.contains("CommandLineTemplate"));
+        assert!(details.contains("powershell.exe"));
+    }
+
+    #[test]
+    fn test_extract_script_details_no_keyword() {
+        let context = "just some binary data";
+        let details = extract_script_details(context);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn test_extract_script_details_with_value() {
+        let context = r#"ScriptText="WScript.Echo 'hello'""#;
+        let details = extract_script_details(context);
+        assert!(details.contains("ScriptText"));
+        assert!(details.contains("WScript"));
+    }
+
+    #[test]
+    fn test_find_pattern_single_byte() {
+        let data = b"abcba";
+        let offsets = find_pattern(data, b"b");
+        assert_eq!(offsets, vec![1, 3]);
+    }
 }

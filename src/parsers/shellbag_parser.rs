@@ -895,4 +895,177 @@ mod tests {
             }
         }
     }
+
+    // ─── Coverage for parse_shellbags_from_hive ─────────────────────────
+
+    #[test]
+    fn test_parse_shellbags_from_hive_empty_data() {
+        let result = parse_shellbags_from_hive(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_shellbags_from_hive_garbage_data() {
+        let data = vec![0xFFu8; 1024];
+        let result = parse_shellbags_from_hive(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_shellbags_from_hive_too_small() {
+        let data = vec![0u8; 10];
+        let result = parse_shellbags_from_hive(&data);
+        assert!(result.is_err());
+    }
+
+    // ─── Coverage for parse_shellbags pipeline ──────────────────────────
+
+    #[test]
+    fn test_parse_shellbags_provider_fails() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("disk error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/AppData/Local/Microsoft/Windows/UsrClass.dat", 'C'),
+            hive_type: RegistryHiveType::UsrClass { username: "admin".to_string() },
+        });
+        let mut store = TimelineStore::new();
+
+        let result = parse_shellbags(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_shellbags_invalid_hive_data() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        struct InvalidHiveProvider;
+        impl CollectionProvider for InvalidHiveProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xDE, 0xAD, 0xBE, 0xEF]) // Not a valid hive
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/UsrClass.dat", 'C'),
+            hive_type: RegistryHiveType::UsrClass { username: "admin".to_string() },
+        });
+        let mut store = TimelineStore::new();
+
+        let result = parse_shellbags(&InvalidHiveProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_shellbags_skips_non_usrclass_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        struct NeverCalledProvider;
+        impl CollectionProvider for NeverCalledProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("should not be called for non-UsrClass hives")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        let mut store = TimelineStore::new();
+
+        let result = parse_shellbags(&NeverCalledProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_shellbag_entry_debug_clone() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let entry = ShellbagEntry {
+            reg_path: "BagMRU\\0".to_string(),
+            folder_name: Some("Documents".to_string()),
+            last_accessed: dt,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.folder_name, entry.folder_name);
+        assert_eq!(cloned.reg_path, entry.reg_path);
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("Documents"));
+    }
+
+    #[test]
+    fn test_extract_name_root_folder_all_known_guids() {
+        // Test My Documents GUID
+        let mut data = vec![0u8; 20];
+        data[2] = 0x1F;
+        data[4..8].copy_from_slice(&[0xBA, 0x8F, 0x0D, 0x45]);
+        data[8..20].copy_from_slice(&[0x25, 0xAD, 0xD0, 0x11, 0x98, 0xA8, 0x08, 0x00, 0x36, 0x1B, 0x11, 0x03]);
+        assert_eq!(extract_name_from_shell_item(&data), Some("My Documents".to_string()));
+
+        // Test Recycle Bin GUID
+        let mut data2 = vec![0u8; 20];
+        data2[2] = 0x1F;
+        data2[4..8].copy_from_slice(&[0x40, 0xF0, 0x5F, 0x64]);
+        data2[8..20].copy_from_slice(&[0x81, 0x50, 0x1B, 0x10, 0x9F, 0x08, 0x00, 0xAA, 0x00, 0x2F, 0x95, 0x4E]);
+        assert_eq!(extract_name_from_shell_item(&data2), Some("Recycle Bin".to_string()));
+
+        // Test Network GUID
+        let mut data3 = vec![0u8; 20];
+        data3[2] = 0x1F;
+        data3[4..8].copy_from_slice(&[0x0D, 0x1A, 0x2C, 0xF0]);
+        data3[8..20].copy_from_slice(&[0x21, 0xBE, 0x50, 0x43, 0x88, 0xB0, 0x73, 0x67, 0xFC, 0x96, 0xEF, 0x3C]);
+        assert_eq!(extract_name_from_shell_item(&data3), Some("Network".to_string()));
+    }
+
+    #[test]
+    fn test_extract_name_root_folder_unknown_guid() {
+        let mut data = vec![0u8; 20];
+        data[2] = 0x1F;
+        // Unknown GUID
+        data[4..20].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                                       0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]);
+        assert_eq!(extract_name_from_shell_item(&data), Some("Known Folder".to_string()));
+    }
 }

@@ -646,4 +646,196 @@ mod tests {
         assert_eq!(summary.restart_areas.len(), 2);
         assert_eq!(summary.record_page_count, 0);
     }
+
+    // ─── Coverage for parse_logfile_artifact with real data ──────────────
+
+    #[test]
+    fn test_parse_logfile_artifact_with_valid_data() {
+        use crate::collection::path::NormalizedPath;
+
+        let logfile_data = build_test_logfile(5000, 4999, 1, 10);
+
+        struct ValidLogProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for ValidLogProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = ValidLogProvider { data: logfile_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.logfile = Some(NormalizedPath::from_image_path("/$LogFile", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_logfile_artifact(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Should have created entries for the 2 restart areas
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_logfile_artifact_with_gaps_sets_anomaly() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut logfile_data = build_test_logfile(1000, 999, 1, 5);
+        // Zero out a RCRD page in the middle
+        let gap_offset = 3 * LOG_PAGE_SIZE;
+        for b in &mut logfile_data[gap_offset..gap_offset + LOG_PAGE_SIZE] {
+            *b = 0;
+        }
+
+        struct GapLogProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for GapLogProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = GapLogProvider { data: logfile_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.logfile = Some(NormalizedPath::from_image_path("/$LogFile", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_logfile_artifact(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() > 0);
+        // At least one entry should have LOG_GAP_DETECTED anomaly
+        let has_gap_anomaly = store.entries().any(|e| {
+            e.anomalies.contains(AnomalyFlags::LOG_GAP_DETECTED)
+        });
+        assert!(has_gap_anomaly, "Should detect gap anomaly in logfile entries");
+    }
+
+    #[test]
+    fn test_parse_logfile_artifact_provider_fails() {
+        use crate::collection::path::NormalizedPath;
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("disk error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.logfile = Some(NormalizedPath::from_image_path("/$LogFile", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_logfile_artifact(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok()); // Should not error, just warn
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_logfile_artifact_invalid_data() {
+        use crate::collection::path::NormalizedPath;
+
+        struct InvalidProvider;
+        impl CollectionProvider for InvalidProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 100]) // Too small for $LogFile
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.logfile = Some(NormalizedPath::from_image_path("/$LogFile", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_logfile_artifact(&InvalidProvider, &manifest, &mut store);
+        assert!(result.is_ok()); // Should not error, just warn
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_logfile_entry_description_format() {
+        use crate::collection::path::NormalizedPath;
+
+        let logfile_data = build_test_logfile(12345, 12344, 2, 5);
+
+        struct LogProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for LogProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = LogProvider { data: logfile_data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.logfile = Some(NormalizedPath::from_image_path("/$LogFile", 'C'));
+        let mut store = TimelineStore::new();
+
+        let _ = parse_logfile_artifact(&provider, &manifest, &mut store);
+        assert_eq!(store.len(), 2);
+
+        // Check entry description format
+        let entry = store.get(0).unwrap();
+        assert!(entry.path.contains("$LogFile restart area"));
+        assert!(entry.path.contains("LSN="));
+        assert!(entry.path.contains("clients="));
+        assert!(matches!(entry.event_type, EventType::Other(ref s) if s == "LogCheckpoint"));
+        assert!(entry.sources.contains(&ArtifactSource::LogFile));
+    }
+
+    #[test]
+    fn test_analyze_record_pages_zeroed_before_any_rcrd() {
+        // Zeroed page with count == 0 should NOT flag gap
+        let mut data = vec![0u8; 4 * LOG_PAGE_SIZE];
+        build_restart_page(&mut data, 0, 100, 1);
+        build_restart_page(&mut data, LOG_PAGE_SIZE, 200, 1);
+        // Pages 2 and 3 are zeroed (no RCRD at all)
+        let (count, gaps) = analyze_record_pages(&data);
+        assert_eq!(count, 0);
+        assert!(!gaps);
+    }
 }

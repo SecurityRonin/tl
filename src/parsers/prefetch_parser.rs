@@ -616,4 +616,339 @@ mod tests {
             "CMD.EXE-087B4001.pf"
         );
     }
+
+    // ─── Pipeline integration and deeper coverage ────────────────────────
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_with_valid_v17() {
+        use crate::collection::path::NormalizedPath;
+        use chrono::TimeZone;
+
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 10, 30, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000;
+
+        let pf_data = build_test_prefetch_v17("CMD.EXE", filetime, 5);
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/CMD.EXE-087B4001.pf", 'C'),
+        );
+
+        struct PrefetchProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for PrefetchProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut store = TimelineStore::new();
+        let provider = PrefetchProvider { data: pf_data };
+        let result = parse_prefetch_files(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+
+        let e = store.get(0).unwrap();
+        assert!(e.path.contains("CMD.EXE"));
+        assert!(e.path.contains("run_count: 5"));
+        assert_eq!(e.event_type, EventType::Execute);
+        assert!(matches!(&e.sources[0], ArtifactSource::Prefetch));
+        assert_eq!(e.primary_timestamp, dt);
+    }
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_with_failing_provider() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/CMD.EXE-087B4001.pf", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("File read error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_prefetch_files(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_oversized_file() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/HUGE.EXE-00000000.pf", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct OversizedProvider;
+        impl CollectionProvider for OversizedProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Return data larger than MAX_PREFETCH_SIZE (1MB)
+                Ok(vec![0u8; 1_000_001])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_prefetch_files(&OversizedProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0); // Skipped due to size
+    }
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_invalid_pf_data() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/BAD.EXE-00000000.pf", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct BadDataProvider;
+        impl CollectionProvider for BadDataProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Valid size but garbage content
+                Ok(vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE].into_iter().cycle().take(512).collect())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_prefetch_files(&BadDataProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_multiple_files() {
+        use crate::collection::path::NormalizedPath;
+        use chrono::TimeZone;
+
+        let dt = Utc.with_ymd_and_hms(2025, 3, 15, 14, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/CMD.EXE-087B4001.pf", 'C'),
+        );
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/BAD.EXE-00000000.pf", 'C'),
+        );
+
+        struct MixedProvider {
+            good_data: Vec<u8>,
+        }
+        impl CollectionProvider for MixedProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                if path.to_string().contains("CMD") {
+                    Ok(self.good_data.clone())
+                } else {
+                    Ok(vec![0u8; 10]) // too small to parse
+                }
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut store = TimelineStore::new();
+        let provider = MixedProvider {
+            good_data: build_test_prefetch_v17("CMD.EXE", filetime, 3),
+        };
+        let result = parse_prefetch_files(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Only the valid CMD.EXE file should produce entries
+        assert!(store.len() >= 1);
+        let e = store.get(0).unwrap();
+        assert!(e.path.contains("CMD.EXE"));
+    }
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_zero_filetime() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/ZERO.EXE-00000000.pf", 'C'),
+        );
+
+        // Build a prefetch with filetime=0 (no valid run times)
+        let pf_data = build_test_prefetch_v17("ZERO.EXE", 0, 1);
+
+        struct ZeroProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for ZeroProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut store = TimelineStore::new();
+        let provider = ZeroProvider { data: pf_data };
+        let result = parse_prefetch_files(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // No entries because filetime=0 produces None from forensic_filetime_to_datetime
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_prefetch_files_pipeline_exactly_max_size() {
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.prefetch.push(
+            NormalizedPath::from_image_path("/Windows/Prefetch/EXACT.EXE-00000000.pf", 'C'),
+        );
+
+        struct ExactSizeProvider;
+        impl CollectionProvider for ExactSizeProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Exactly MAX_PREFETCH_SIZE - should NOT be skipped
+                Ok(vec![0u8; 1_000_000])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut store = TimelineStore::new();
+        let result = parse_prefetch_files(&ExactSizeProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Won't be skipped (exactly MAX_PREFETCH_SIZE), but will fail to parse
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_in_memory_file_read_partial() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut file = InMemoryFile::new(data);
+        let mut buf = [0u8; 5];
+        let n = file.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(buf, [1, 2, 3, 4, 5]);
+        // Read remaining
+        let n = file.read(&mut buf).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(buf, [6, 7, 8, 9, 10]);
+        // Read past end
+        let n = file.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_in_memory_file_metadata_vfile_type_is_file() {
+        let file = InMemoryFile::new(vec![42; 100]);
+        let meta = file.metadata().unwrap();
+        assert!(matches!(meta.file_type, VFileType::File));
+        assert!(meta.created.is_none());
+        assert!(meta.accessed.is_none());
+        assert!(meta.modified.is_none());
+        assert_eq!(meta.size, 100);
+    }
+
+    #[test]
+    fn test_build_test_prefetch_v17_name_truncation() {
+        // Test with a very long name that exceeds the 60 byte copy limit
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let secs = dt.timestamp() + 11_644_473_600;
+        let filetime = (secs as u64) * 10_000_000;
+
+        let long_name = "A".repeat(50); // 50 chars = 100 bytes UTF-16, but copy limit is 60
+        let data = build_test_prefetch_v17(&long_name, filetime, 1);
+        let vfile: Box<dyn VirtualFile> = Box::new(InMemoryFile::new(data));
+        let pf = read_prefetch_file("LONG.EXE-00000000.pf", vfile).unwrap();
+        // Name will be truncated to 30 chars (60 bytes / 2)
+        assert_eq!(pf.name.len(), 30);
+    }
+
+    #[test]
+    fn test_forensic_filetime_just_after_epoch() {
+        use chrono::TimeZone;
+        // Just 1 second after Unix epoch
+        let epoch_diff: u64 = 11_644_473_600;
+        let filetime = (epoch_diff + 1) * 10_000_000;
+        let ft = Filetime::new(filetime);
+        let result = forensic_filetime_to_datetime(&ft).unwrap();
+        assert_eq!(result, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap());
+    }
+
+    #[test]
+    fn test_forensic_filetime_just_before_epoch() {
+        // 1 tick before Unix epoch (negative secs)
+        let epoch_diff: u64 = 11_644_473_600;
+        let filetime = (epoch_diff - 1) * 10_000_000;
+        let ft = Filetime::new(filetime);
+        // This should produce secs = -1, which returns None
+        assert!(forensic_filetime_to_datetime(&ft).is_none());
+    }
 }

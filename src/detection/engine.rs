@@ -299,4 +299,186 @@ detection:
         assert_eq!(fields.get("Computer").unwrap(), "WORKSTATION1");
         assert_eq!(fields.get("Key").unwrap(), "Value");
     }
+
+    // ─── Coverage: load_rules_from_dir and load_rules_recursive ─────────
+
+    #[test]
+    fn test_load_rules_from_dir_loads_yml_and_yaml_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Write valid Sigma rule as .yml
+        std::fs::write(
+            tmp.path().join("rule1.yml"),
+            "title: Rule1\nstatus: test\nlevel: low\nlogsource:\n    product: windows\ndetection:\n    sel:\n        EventID: 1\n    condition: sel\n",
+        ).unwrap();
+        // Write valid Sigma rule as .yaml
+        std::fs::write(
+            tmp.path().join("rule2.yaml"),
+            "title: Rule2\nstatus: test\nlevel: high\nlogsource:\n    product: windows\ndetection:\n    sel:\n        EventID: 2\n    condition: sel\n",
+        ).unwrap();
+        // Write a non-rule file that should be ignored
+        std::fs::write(tmp.path().join("not_a_rule.txt"), "just text").unwrap();
+
+        let mut engine = DetectionEngine::new();
+        let count = engine.load_rules_from_dir(tmp.path()).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(engine.rule_count(), 2);
+    }
+
+    #[test]
+    fn test_load_rules_from_dir_recurses_subdirectories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            sub.join("deep_rule.yml"),
+            "title: Deep\nstatus: test\nlevel: medium\nlogsource:\n    product: windows\ndetection:\n    sel:\n        EventID: 99\n    condition: sel\n",
+        ).unwrap();
+
+        let mut engine = DetectionEngine::new();
+        let count = engine.load_rules_from_dir(tmp.path()).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(engine.rule_count(), 1);
+    }
+
+    #[test]
+    fn test_load_rules_from_dir_skips_invalid_yaml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Invalid YAML (missing detection)
+        std::fs::write(
+            tmp.path().join("bad.yml"),
+            "title: broken\nstatus: test\nlevel: low\nlogsource:\n    product: windows\n",
+        ).unwrap();
+        // Valid YAML
+        std::fs::write(
+            tmp.path().join("good.yml"),
+            "title: Good\nstatus: test\nlevel: low\nlogsource:\n    product: windows\ndetection:\n    sel:\n        EventID: 1\n    condition: sel\n",
+        ).unwrap();
+
+        let mut engine = DetectionEngine::new();
+        let count = engine.load_rules_from_dir(tmp.path()).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_load_rules_from_dir_empty_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut engine = DetectionEngine::new();
+        let count = engine.load_rules_from_dir(tmp.path()).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(engine.rule_count(), 0);
+    }
+
+    #[test]
+    fn test_load_rules_from_dir_nonexistent_directory() {
+        let mut engine = DetectionEngine::new();
+        let count = engine.load_rules_from_dir(Path::new("/nonexistent/path/xyz")).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_load_rules_from_dir_ignores_files_without_extension() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("no_extension"), "title: x\n").unwrap();
+
+        let mut engine = DetectionEngine::new();
+        let count = engine.load_rules_from_dir(tmp.path()).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ─── Coverage: Detection struct fields ──────────────────────────────
+
+    #[test]
+    fn test_detection_rule_id_is_populated() {
+        let mut engine = DetectionEngine::new();
+        engine.add_rule(SigmaRule::from_yaml(r#"
+title: Test With ID
+id: abc-123-def
+status: test
+level: medium
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 4688
+    condition: selection
+"#).unwrap());
+
+        let event = make_evtx(4688, "Security", &[]);
+        let detections = engine.evaluate(&event);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, Some("abc-123-def".to_string()));
+        assert_eq!(detections[0].rule_title, "Test With ID");
+    }
+
+    #[test]
+    fn test_detection_rule_id_is_none_when_not_set() {
+        let mut engine = DetectionEngine::new();
+        engine.add_rule(SigmaRule::from_yaml(r#"
+title: No ID Rule
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 1
+    condition: selection
+"#).unwrap());
+
+        let event = make_evtx(1, "Security", &[]);
+        let detections = engine.evaluate(&event);
+        assert_eq!(detections.len(), 1);
+        assert!(detections[0].rule_id.is_none());
+    }
+
+    // ─── Coverage: event_to_fields includes Provider ────────────────────
+
+    #[test]
+    fn test_event_to_fields_includes_provider() {
+        let event = make_evtx(1, "Security", &[]);
+        let fields = DetectionEngine::event_to_fields(&event);
+        assert_eq!(fields.get("Provider").unwrap(), "Microsoft-Windows-Security-Auditing");
+    }
+
+    // ─── Coverage: evaluate_batch with empty events ─────────────────────
+
+    #[test]
+    fn test_evaluate_batch_empty_events() {
+        let engine = DetectionEngine::new();
+        let detections = engine.evaluate_batch(&[]);
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_batch_no_rules_no_detections() {
+        let engine = DetectionEngine::new();
+        let events = vec![make_evtx(1, "Security", &[])];
+        let detections = engine.evaluate_batch(&events);
+        assert!(detections.is_empty());
+    }
+
+    // ─── Coverage: Detection clone ──────────────────────────────────────
+
+    #[test]
+    fn test_detection_clone() {
+        let mut engine = DetectionEngine::new();
+        engine.add_rule(SigmaRule::from_yaml(r#"
+title: Clone Test
+status: test
+level: critical
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 4688
+    condition: selection
+"#).unwrap());
+
+        let event = make_evtx(4688, "Security", &[("Cmd", "test.exe")]);
+        let detections = engine.evaluate(&event);
+        let cloned = detections[0].clone();
+        assert_eq!(cloned.rule_title, "Clone Test");
+        assert_eq!(cloned.level, SigmaLevel::Critical);
+        assert_eq!(cloned.event.event_id, 4688);
+    }
 }

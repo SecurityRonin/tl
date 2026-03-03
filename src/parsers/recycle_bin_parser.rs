@@ -647,4 +647,209 @@ mod tests {
         let debug_str = format!("{:?}", entry);
         assert!(debug_str.contains("test"));
     }
+
+    // ─── Coverage for parse_recycle_bin pipeline ─────────────────────────
+
+    #[test]
+    fn test_parse_recycle_bin_with_valid_i_file() {
+        use chrono::TimeZone;
+        use crate::collection::path::NormalizedPath;
+
+        let deletion_time = Utc.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let path_str = r"C:\Users\admin\Documents\secret.docx";
+        let path_utf16: Vec<u8> = path_str
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let char_count = path_str.encode_utf16().count() + 1;
+
+        let mut data = vec![0u8; 28 + char_count * 2];
+        data[0..8].copy_from_slice(&2u64.to_le_bytes());
+        data[8..16].copy_from_slice(&12345u64.to_le_bytes());
+        data[16..24].copy_from_slice(&datetime_to_filetime(deletion_time).to_le_bytes());
+        data[24..28].copy_from_slice(&(char_count as u32).to_le_bytes());
+        data[28..28 + path_utf16.len()].copy_from_slice(&path_utf16);
+
+        struct RbProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for RbProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = RbProvider { data };
+        let mut manifest = ArtifactManifest::default();
+        manifest.recycle_bin.push(NormalizedPath::from_image_path("/$Recycle.Bin/$IABC123.docx", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_recycle_bin(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 1);
+        let entry = store.get(0).unwrap();
+        assert_eq!(entry.event_type, EventType::FileDelete);
+        assert!(entry.path.contains("secret.docx"));
+        assert_eq!(entry.metadata.file_size, Some(12345));
+        assert!(entry.sources.contains(&ArtifactSource::RecycleBin));
+    }
+
+    #[test]
+    fn test_parse_recycle_bin_filters_non_i_files() {
+        use crate::collection::path::NormalizedPath;
+
+        struct NeverCalledProvider;
+        impl CollectionProvider for NeverCalledProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("should not be called for non-$I files")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        // Add $R file (not $I) - should be filtered out
+        manifest.recycle_bin.push(NormalizedPath::from_image_path("/$Recycle.Bin/$RABC123.docx", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_recycle_bin(&NeverCalledProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_recycle_bin_provider_fails() {
+        use crate::collection::path::NormalizedPath;
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("disk error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.recycle_bin.push(NormalizedPath::from_image_path("/$Recycle.Bin/$IABC123.docx", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_recycle_bin(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_recycle_bin_oversized_file() {
+        use crate::collection::path::NormalizedPath;
+
+        struct OversizedProvider;
+        impl CollectionProvider for OversizedProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0u8; MAX_I_FILE_SIZE + 1])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.recycle_bin.push(NormalizedPath::from_image_path("/$Recycle.Bin/$IABC123.docx", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_recycle_bin(&OversizedProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_recycle_bin_invalid_data() {
+        use crate::collection::path::NormalizedPath;
+
+        struct InvalidProvider;
+        impl CollectionProvider for InvalidProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Invalid version
+                let mut data = vec![0u8; 100];
+                data[0..8].copy_from_slice(&99u64.to_le_bytes());
+                Ok(data)
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.recycle_bin.push(NormalizedPath::from_image_path("/$Recycle.Bin/$IABC.txt", 'C'));
+        let mut store = TimelineStore::new();
+
+        let result = parse_recycle_bin(&InvalidProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_recycle_bin_with_forward_slash_path() {
+        use crate::collection::path::NormalizedPath;
+
+        // Test that $I files with forward slashes are also detected
+        let mut manifest = ArtifactManifest::default();
+        manifest.recycle_bin.push(NormalizedPath::from_image_path("/$Recycle.Bin/$IABC.txt", 'C'));
+
+        struct StubProvider;
+        impl CollectionProvider for StubProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                // Invalid data to trigger parse error
+                Ok(vec![0u8; 10])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut store = TimelineStore::new();
+        let result = parse_recycle_bin(&StubProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+    }
 }

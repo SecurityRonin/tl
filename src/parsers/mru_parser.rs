@@ -928,4 +928,300 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().contains("notes.txt"));
     }
+
+    // ─── Pipeline integration and hive parsing coverage ──────────────────
+
+    #[test]
+    fn test_parse_mru_from_hive_invalid_data() {
+        let result = parse_mru_from_hive(&[0u8; 100]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_mru_from_hive_empty_data() {
+        let result = parse_mru_from_hive(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_mru_from_hive_truncated() {
+        let mut data = vec![0u8; 50];
+        data[0..4].copy_from_slice(b"regf");
+        let result = parse_mru_from_hive(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_mru_lists_with_ntuser_hive_that_fails_to_open() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                anyhow::bail!("Permission denied")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_mru_lists(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_mru_lists_with_invalid_hive_content() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(vec![0xAB; 1024])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_mru_lists(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_mru_lists_skips_non_ntuser_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SOFTWARE", 'C'),
+            hive_type: RegistryHiveType::Software,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SAM", 'C'),
+            hive_type: RegistryHiveType::Sam,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct PanicProvider;
+        impl CollectionProvider for PanicProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                panic!("Should not be called for non-NTUSER hives")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_mru_lists(&PanicProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_short_utf16_no_dot() {
+        // A valid UTF-16 string with exactly 3 chars but no dot/slash
+        // Should still be returned as best_name when nothing better exists
+        let mut data = vec![0u8; 10]; // header
+        let name = "abc";
+        let utf16: Vec<u8> = name
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16);
+        data.extend_from_slice(&[0, 0]);
+
+        let result = extract_filename_from_pidl(&data);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_2_char_string_too_short() {
+        // A 2-char string should not meet the >= 3 threshold
+        let mut data = vec![0u8; 10];
+        let name = "ab";
+        let utf16: Vec<u8> = name
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16);
+        data.extend_from_slice(&[0, 0]);
+        // Pad to ensure we don't hit other strings
+        data.extend_from_slice(&[0xFF; 10]);
+
+        let result = extract_filename_from_pidl(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_prefers_dotted_over_generic() {
+        // A shorter string with a dot should be preferred over a longer generic one
+        let mut data = vec![0u8; 8]; // min header
+
+        // First: a 4-char generic string "test" (no dot)
+        let gen = "test";
+        let utf16_gen: Vec<u8> = gen
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16_gen);
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&[0xFF; 4]); // separator
+
+        // Second: a 10-char filename with dot "report.doc"
+        let filename = "report.doc";
+        let utf16_fn: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&utf16_fn);
+        data.extend_from_slice(&[0, 0]);
+
+        let result = extract_filename_from_pidl(&data);
+        assert!(result.is_some());
+        let name = result.unwrap();
+        // The longer filename with a dot should win
+        assert!(name.contains("report.doc"));
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_all_control_chars() {
+        // Data with control characters (< 0x20) interspersed - no valid UTF-16 strings
+        let data = vec![0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00];
+        assert!(extract_filename_from_pidl(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_null_at_start() {
+        // Data that starts with a null terminator
+        let mut data = vec![0, 0]; // null terminator immediately
+        data.extend_from_slice(&[0x41, 0x00, 0x42, 0x00]); // "AB" after null
+        let result = extract_filename_from_recentdocs(&data);
+        assert!(result.is_none()); // Empty before null
+    }
+
+    #[test]
+    fn test_parse_mru_lists_multiple_ntuser_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "admin".to_string(),
+            },
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/analyst/NTUSER.DAT", 'C'),
+            hive_type: RegistryHiveType::NtUser {
+                username: "analyst".to_string(),
+            },
+        });
+
+        let mut store = TimelineStore::new();
+
+        use std::sync::atomic::AtomicU32;
+        static MRU_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+        struct CountingProvider;
+        impl CollectionProvider for CountingProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                MRU_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![0u8; 512]) // invalid hive data
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        MRU_CALL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let result = parse_mru_lists(&CountingProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(MRU_CALL_COUNT.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_next_mru_id_has_mr_prefix() {
+        let id = next_mru_id();
+        assert_eq!((id >> 48) & 0xFFFF, 0x4D52);
+    }
+
+    #[test]
+    fn test_extract_filename_from_recentdocs_only_non_alpha() {
+        // Characters that are not alphanumeric
+        let filename = "---";
+        let mut data: Vec<u8> = filename
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        data.extend_from_slice(&[0, 0]);
+        let result = extract_filename_from_recentdocs(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_filename_from_pidl_high_byte_non_zero() {
+        // UTF-16LE with non-zero high bytes (non-ASCII) - these don't match
+        // the printable ASCII range filter (0x20..0x7F in low byte, 0x00 in high byte)
+        let data = vec![0x41, 0x01, 0x42, 0x01, 0x43, 0x01, 0x44, 0x01, 0x00, 0x00];
+        // These are valid UTF-16 but won't match the scanner's ASCII heuristic
+        // Result depends on whether the scanner finds them
+        let _result = extract_filename_from_pidl(&data);
+        // Just verify no panic
+    }
 }

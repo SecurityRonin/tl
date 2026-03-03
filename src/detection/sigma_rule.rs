@@ -359,4 +359,216 @@ logsource:
 "#;
         assert!(SigmaRule::from_yaml(yaml).is_err());
     }
+
+    // ─── Coverage: SigmaLevel::from_str unknown level ───────────────────
+
+    #[test]
+    fn test_sigma_level_unknown_returns_error() {
+        let result = SigmaLevel::from_str("catastrophic");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("unknown Sigma level"), "Got: {}", err_msg);
+    }
+
+    // ─── Coverage: level defaults to medium when missing ────────────────
+
+    #[test]
+    fn test_parse_sigma_rule_default_level_is_medium() {
+        let yaml = r#"
+title: No Level
+status: test
+logsource:
+    product: windows
+detection:
+    sel:
+        EventID: 1
+    condition: sel
+"#;
+        let rule = SigmaRule::from_yaml(yaml).unwrap();
+        assert_eq!(rule.level, SigmaLevel::Medium);
+    }
+
+    // ─── Coverage: from_file with nonexistent file ──────────────────────
+
+    #[test]
+    fn test_from_file_nonexistent_returns_error() {
+        let result = SigmaRule::from_file(std::path::Path::new("/nonexistent/rule.yml"));
+        assert!(result.is_err());
+    }
+
+    // ─── Coverage: from_file with valid file ────────────────────────────
+
+    #[test]
+    fn test_from_file_valid_rule() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test_rule.yml");
+        std::fs::write(&path, "title: FromFile\nstatus: test\nlevel: low\nlogsource:\n    product: windows\ndetection:\n    sel:\n        EventID: 1\n    condition: sel\n").unwrap();
+
+        let rule = SigmaRule::from_file(&path).unwrap();
+        assert_eq!(rule.title, "FromFile");
+    }
+
+    // ─── Coverage: invalid YAML ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_invalid_yaml_returns_error() {
+        let yaml = "{{{{not valid yaml at all";
+        assert!(SigmaRule::from_yaml(yaml).is_err());
+    }
+
+    // ─── Coverage: YAML that's not a mapping ────────────────────────────
+
+    #[test]
+    fn test_parse_yaml_not_mapping_returns_error() {
+        let yaml = "- item1\n- item2\n";
+        let result = SigmaRule::from_yaml(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mapping"));
+    }
+
+    // ─── Coverage: value_to_string for bool ─────────────────────────────
+
+    #[test]
+    fn test_parse_boolean_field_value() {
+        let yaml = r#"
+title: Bool Test
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection:
+        Enabled: true
+    condition: selection
+"#;
+        let rule = SigmaRule::from_yaml(yaml).unwrap();
+        let sel = &rule.detection["selection"];
+        assert_eq!(sel[0].values, vec!["true"]);
+    }
+
+    // ─── Coverage: missing condition in detection ───────────────────────
+
+    #[test]
+    fn test_parse_missing_condition_returns_error() {
+        let yaml = r#"
+title: No Condition
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 1
+"#;
+        let result = SigmaRule::from_yaml(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("condition"));
+    }
+
+    // ─── Coverage: detection as non-mapping ─────────────────────────────
+
+    #[test]
+    fn test_parse_detection_not_mapping_returns_error() {
+        let yaml = r#"
+title: Bad Detection
+status: test
+level: low
+logsource:
+    product: windows
+detection: just_a_string
+"#;
+        let result = SigmaRule::from_yaml(yaml);
+        assert!(result.is_err());
+    }
+
+    // ─── Coverage: logsource missing ────────────────────────────────────
+
+    #[test]
+    fn test_parse_rule_without_logsource_uses_default() {
+        let yaml = r#"
+title: No Logsource
+status: test
+level: low
+detection:
+    sel:
+        EventID: 1
+    condition: sel
+"#;
+        let rule = SigmaRule::from_yaml(yaml).unwrap();
+        assert!(rule.logsource.category.is_none());
+        assert!(rule.logsource.product.is_none());
+        assert!(rule.logsource.service.is_none());
+    }
+
+    // ─── Coverage: logsource with service field ─────────────────────────
+
+    #[test]
+    fn test_parse_logsource_service() {
+        let yaml = r#"
+title: Svc
+status: test
+level: low
+logsource:
+    product: windows
+    service: sysmon
+    category: process_creation
+detection:
+    sel:
+        EventID: 1
+    condition: sel
+"#;
+        let rule = SigmaRule::from_yaml(yaml).unwrap();
+        assert_eq!(rule.logsource.service, Some("sysmon".into()));
+        assert_eq!(rule.logsource.category, Some("process_creation".into()));
+        assert_eq!(rule.logsource.product, Some("windows".into()));
+    }
+
+    // ─── Coverage: selection is not a mapping (empty) ───────────────────
+
+    #[test]
+    fn test_parse_selection_non_mapping_returns_empty_fields() {
+        let yaml = r#"
+title: Null Selection
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    selection: null
+    condition: selection
+"#;
+        let rule = SigmaRule::from_yaml(yaml).unwrap();
+        let sel = &rule.detection["selection"];
+        assert!(sel.is_empty());
+    }
+
+    // ─── Coverage: SigmaLevel case insensitive ──────────────────────────
+
+    #[test]
+    fn test_sigma_level_case_insensitive() {
+        assert_eq!(SigmaLevel::from_str("HIGH").unwrap(), SigmaLevel::High);
+        assert_eq!(SigmaLevel::from_str("Low").unwrap(), SigmaLevel::Low);
+        assert_eq!(SigmaLevel::from_str("CRITICAL").unwrap(), SigmaLevel::Critical);
+        assert_eq!(SigmaLevel::from_str("Informational").unwrap(), SigmaLevel::Informational);
+        assert_eq!(SigmaLevel::from_str("MEDIUM").unwrap(), SigmaLevel::Medium);
+    }
+
+    // ─── Coverage: id field is None when not present ────────────────────
+
+    #[test]
+    fn test_parse_rule_without_id() {
+        let yaml = r#"
+title: No ID
+status: test
+level: low
+logsource:
+    product: windows
+detection:
+    sel:
+        EventID: 1
+    condition: sel
+"#;
+        let rule = SigmaRule::from_yaml(yaml).unwrap();
+        assert!(rule.id.is_none());
+    }
 }
