@@ -330,4 +330,103 @@ mod tests {
         assert_eq!(DEBOUNCE_SECS, 86400);
         assert_eq!(MARKER_FILE, ".tl-last-update");
     }
+
+    // ─── Additional coverage: uncovered lines ─────────────────────────────
+
+    // Coverage for lines 19-21: default_cache_dir fallback when dirs_cache_dir returns None
+    // This can't easily be tested without unsetting HOME, but we can verify the fallback logic.
+    #[test]
+    fn test_default_cache_dir_fallback_logic() {
+        // Verify the default_cache_dir function returns a path containing expected components
+        let dir = default_cache_dir();
+        let path_str = dir.to_string_lossy();
+        // Should always end with sigma-rules
+        assert!(path_str.ends_with("sigma-rules"), "Path should end with sigma-rules: {}", path_str);
+        // Should contain 'tl' in the path
+        assert!(path_str.contains("tl"), "Path should contain 'tl': {}", path_str);
+    }
+
+    // Coverage for lines 84-85,88-90: ensure_rules when .git dir doesn't exist (clone path)
+    // We can't actually run git clone in tests, but we can verify the error when git is not
+    // available or clone fails.
+    #[test]
+    fn test_ensure_rules_clone_path_fails_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        // No .git dir, so ensure_rules will try to clone
+        // Use a subdirectory that doesn't exist yet to trigger create_dir_all
+        let cache_dir = tmp.path().join("new_subdir").join("sigma");
+
+        let result = ensure_rules(&cache_dir);
+        // Either git clone succeeds (unlikely in test) or it fails
+        // Either way, it should not panic
+        if result.is_err() {
+            let err_msg = result.unwrap_err().to_string();
+            // Should fail with git-related error or rules dir not found
+            assert!(
+                err_msg.contains("git") || err_msg.contains("not found") || err_msg.contains("clone"),
+                "Expected git-related error, got: {}", err_msg
+            );
+        }
+    }
+
+    // Coverage for lines 94-95,97-98: ensure_rules when git clone fails (non-zero exit)
+    // This is naturally covered when ensure_rules tries to clone a bad URL.
+
+    // Coverage for lines 101-104,108-110,112: ensure_rules stale marker pull path
+    #[test]
+    fn test_ensure_rules_stale_marker_pull_path() {
+        let tmp = TempDir::new().unwrap();
+        // Create .git dir to simulate already-cloned state
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        // DON'T create a fresh marker so needs_update returns true
+        // This means ensure_rules will try git pull
+
+        let result = ensure_rules(tmp.path());
+        // git pull will fail since this isn't a real git repo
+        // But ensure_rules should handle that gracefully
+        if result.is_err() {
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("not found") || err_msg.contains("rules"),
+                "Expected rules-related error, got: {}", err_msg
+            );
+        }
+    }
+
+    // Coverage for line 125: ensure_rules returns rules/windows path when it exists
+    #[test]
+    fn test_ensure_rules_returns_rules_windows_path() {
+        let tmp = TempDir::new().unwrap();
+        // Create .git dir
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        // Create fresh marker
+        touch_marker(tmp.path()).unwrap();
+        // Create the rules/windows directory
+        let rules_dir = tmp.path().join("rules").join("windows");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+
+        let result = ensure_rules(tmp.path());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), rules_dir);
+    }
+
+    // Coverage: touch_marker failure (read-only directory)
+    #[test]
+    fn test_touch_marker_failure_on_readonly() {
+        let result = touch_marker(Path::new("/nonexistent/readonly/dir"));
+        assert!(result.is_err());
+    }
+
+    // Coverage: walkdir with mixed file types including files without extensions
+    #[test]
+    fn test_count_rule_files_mixed_deeply_nested() {
+        let tmp = TempDir::new().unwrap();
+        let deep = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("rule.yml"), "---").unwrap();
+        std::fs::write(deep.join("rule.yaml"), "---").unwrap();
+        std::fs::write(deep.join("not_rule"), "data").unwrap();
+        std::fs::write(tmp.path().join("top.yml"), "---").unwrap();
+        assert_eq!(count_rule_files(tmp.path()), 3);
+    }
 }

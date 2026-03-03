@@ -1373,4 +1373,243 @@ mod tests {
         let (target_path, _, _, _) = result.unwrap();
         assert!(target_path.is_none()); // LinkInfo couldn't be parsed
     }
+
+    // ─── Pipeline tests for parse_jump_lists ────────────────────────────
+
+    #[test]
+    fn test_parse_jump_lists_auto_entries_no_timestamps() {
+        // Test the "no primary_timestamp -> continue" branch in auto parsing (line 322)
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let lnk = build_minimal_lnk(0, 0, 0); // all zero timestamps
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/test/test.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct ZeroTsProvider { data: Vec<u8> }
+        impl CollectionProvider for ZeroTsProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&ZeroTsProvider { data: lnk }, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Entry has no timestamps -> skipped -> store empty
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_custom_entries_with_valid_timestamps() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+        use chrono::TimeZone;
+
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        let lnk = build_minimal_lnk(
+            datetime_to_filetime(created),
+            0,
+            datetime_to_filetime(written),
+        );
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/test/test.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct LnkProvider { data: Vec<u8> }
+        impl CollectionProvider for LnkProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&LnkProvider { data: lnk }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_custom_open_error() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/test/missing.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("File not found")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_custom_too_large() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/test/big.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct HugeProvider;
+        impl CollectionProvider for HugeProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(vec![0u8; MAX_JUMPLIST_SIZE + 1])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&HugeProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jump_lists_auto_and_custom_together() {
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+        use chrono::TimeZone;
+
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
+        let lnk = build_minimal_lnk(0, 0, datetime_to_filetime(written));
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_auto.push(
+            NormalizedPath::from_image_path("/test/test.automaticDestinations-ms", 'C'),
+        );
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/test/test.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct MixedProvider { lnk_data: Vec<u8> }
+        impl CollectionProvider for MixedProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                if path.to_string().contains("automatic") {
+                    // Return invalid OLE data -> error path
+                    Ok(vec![0xAAu8; 512])
+                } else {
+                    Ok(self.lnk_data.clone())
+                }
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&MixedProvider { lnk_data: lnk }, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Custom should have produced entries, auto should have failed gracefully
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_automatic_destinations_empty_compound_file() {
+        // Providing too-small data for a compound file should error
+        let data = vec![0u8; 10];
+        let result = parse_automatic_destinations(&data, "test.automaticDestinations-ms");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_only_created_timestamp() {
+        use chrono::TimeZone;
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        // Only created time, no modified or accessed
+        let lnk = build_minimal_lnk(datetime_to_filetime(created), 0, 0);
+        let results = parse_custom_destinations(&lnk, "test.customDestinations-ms").unwrap();
+        assert_eq!(results.len(), 1);
+        // created is Some, modified is None, accessed is None
+        assert!(results[0].1.is_some()); // created
+        assert!(results[0].2.is_none()); // modified (write_time)
+        assert!(results[0].3.is_none()); // accessed
+    }
+
+    #[test]
+    fn test_parse_custom_destinations_only_accessed_timestamp() {
+        use chrono::TimeZone;
+        let accessed = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+
+        // Only accessed time
+        let lnk = build_minimal_lnk(0, datetime_to_filetime(accessed), 0);
+        let results = parse_custom_destinations(&lnk, "test.customDestinations-ms").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_none()); // created
+        assert!(results[0].2.is_none()); // modified
+        assert!(results[0].3.is_some()); // accessed
+    }
+
+    #[test]
+    fn test_parse_jump_lists_custom_entries_skip_no_primary_ts() {
+        // Custom entries with all zero timestamps get parsed but skipped
+        // when building timeline entries (primary_timestamp = None -> continue)
+        use crate::collection::manifest::ArtifactManifest;
+        use crate::collection::path::NormalizedPath;
+
+        let lnk = build_minimal_lnk(0, 0, 0);
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.jump_lists_custom.push(
+            NormalizedPath::from_image_path("/test/nots.customDestinations-ms", 'C'),
+        );
+
+        let mut store = TimelineStore::new();
+
+        struct NoTsProvider { data: Vec<u8> }
+        impl CollectionProvider for NoTsProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_jump_lists(&NoTsProvider { data: lnk }, &manifest, &mut store);
+        assert!(result.is_ok());
+        // All zero timestamps -> skipped
+        assert_eq!(store.len(), 0);
+    }
 }

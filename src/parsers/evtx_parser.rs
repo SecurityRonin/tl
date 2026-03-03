@@ -1793,4 +1793,413 @@ mod tests {
         let debug_str = format!("{:?}", e);
         assert!(debug_str.contains("4624"));
     }
+
+    // ─── Pipeline tests for parse_event_logs ─────────────────────────────
+
+    fn make_evtx_manifest() -> ArtifactManifest {
+        use crate::collection::path::NormalizedPath;
+        let mut manifest = ArtifactManifest::default();
+        manifest.event_logs.push(
+            NormalizedPath::from_image_path("/Windows/System32/winevt/Logs/Security.evtx", 'C'),
+        );
+        manifest
+    }
+
+    #[test]
+    fn test_parse_event_logs_open_file_error() {
+        let manifest = make_evtx_manifest();
+        let mut store = TimelineStore::new();
+
+        struct FailOpenProvider;
+        impl CollectionProvider for FailOpenProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("Cannot read EVTX file")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_event_logs(&FailOpenProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_event_logs_invalid_evtx_data() {
+        let manifest = make_evtx_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(vec![0xFFu8; 512])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_event_logs(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_event_logs_multiple_files_all_fail() {
+        use crate::collection::path::NormalizedPath;
+        let mut manifest = ArtifactManifest::default();
+        manifest.event_logs.push(
+            NormalizedPath::from_image_path("/Windows/System32/winevt/Logs/Security.evtx", 'C'),
+        );
+        manifest.event_logs.push(
+            NormalizedPath::from_image_path("/Windows/System32/winevt/Logs/System.evtx", 'C'),
+        );
+        let mut store = TimelineStore::new();
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("read error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_event_logs(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    // ─── Pipeline tests for parse_event_logs_with_entries ────────────────
+
+    #[test]
+    fn test_parse_event_logs_with_entries_empty_manifest() {
+        let manifest = ArtifactManifest::default();
+        let mut store = TimelineStore::new();
+
+        struct MockProvider;
+        impl CollectionProvider for MockProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("should not be called")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_event_logs_with_entries(&MockProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        let entries = result.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_event_logs_with_entries_open_file_error() {
+        let manifest = make_evtx_manifest();
+        let mut store = TimelineStore::new();
+
+        struct FailOpenProvider;
+        impl CollectionProvider for FailOpenProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("Cannot read EVTX file")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_event_logs_with_entries(&FailOpenProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_event_logs_with_entries_invalid_evtx_data() {
+        let manifest = make_evtx_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(vec![0xDE, 0xAD, 0xBE, 0xEF])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_event_logs_with_entries(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // ─── Additional build_description edge cases ────────────────────────
+
+    #[test]
+    fn test_build_description_4648_explicit_logon() {
+        let e = make_entry(4648, "Security-Auditing", "Security",
+            vec![("SubjectUserName", "admin"), ("TargetUserName", "svcaccount"),
+                 ("TargetServerName", "DC01")]);
+        let desc = build_description(&e);
+        // EID 4648 falls into the default catch-all branch
+        assert!(desc.contains("EVT:") || desc.contains("EID:4648"));
+    }
+
+    #[test]
+    fn test_build_description_process_with_cmdline() {
+        let e = make_entry(4688, "Security", "Security",
+            vec![("NewProcessName", r"C:\Windows\System32\cmd.exe"),
+                 ("CommandLine", "cmd /c ipconfig"),
+                 ("SubjectUserName", "admin")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Process]"));
+        assert!(desc.contains("cmd /c ipconfig"));
+        assert!(desc.contains("->"));
+    }
+
+    #[test]
+    fn test_build_description_service_install_v2() {
+        let e = make_entry(7045, "Service Control Manager", "System",
+            vec![("ServiceName", "EvilService"), ("ImagePath", r"C:\temp\backdoor.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Service]"));
+        assert!(desc.contains("EvilService"));
+        assert!(desc.contains("backdoor.exe"));
+    }
+
+    #[test]
+    fn test_build_description_1102_log_cleared_non_rdp() {
+        let e = make_entry(1102, "Eventlog", "Security", vec![]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[LogCleared]"));
+        assert!(desc.contains("Security"));
+        assert!(desc.contains("WS01"));
+    }
+
+    #[test]
+    fn test_build_description_rdp_22_to_25() {
+        for eid in [22, 23, 24, 25] {
+            let e = make_entry(eid, "Microsoft-Windows-TerminalServices-LocalSessionManager",
+                "TerminalServices",
+                vec![("User", "admin"), ("Address", "10.0.0.1")]);
+            let desc = build_description(&e);
+            assert!(desc.contains("[RDP]"), "EID {} desc should contain [RDP]: {}", eid, desc);
+            assert!(desc.contains(&format!("EID:{}", eid)), "desc should have EID: {}", desc);
+        }
+    }
+
+    #[test]
+    fn test_build_description_bits_60_61() {
+        for eid in [60, 61] {
+            let e = make_entry(eid, "BITS", "BITS/Operational",
+                vec![("url", "https://example.com/file.bin"), ("bytesTransferred", "999")]);
+            let desc = build_description(&e);
+            assert!(desc.contains("[BITS]"), "EID {} desc should contain [BITS]: {}", eid, desc);
+            assert!(desc.contains("example.com"), "desc should have URL: {}", desc);
+        }
+    }
+
+    #[test]
+    fn test_build_description_sysmon_process_with_cmdline() {
+        let e = make_entry(1, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\powershell.exe"),
+                 ("CommandLine", "powershell -enc ZQBj"),
+                 ("User", "admin"),
+                 ("ParentImage", r"C:\cmd.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:Process]"));
+        assert!(desc.contains("->"));
+        assert!(desc.contains("powershell -enc ZQBj"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_file_create_v2() {
+        let e = make_entry(11, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\cmd.exe"), ("TargetFilename", r"C:\temp\dropped.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:FileCreate]"));
+        assert!(desc.contains("dropped.exe"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_registry_with_details() {
+        let e = make_entry(13, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\reg.exe"),
+                 ("TargetObject", r"HKLM\SOFTWARE\Run\evil"),
+                 ("Details", r"C:\bad.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:Registry]"));
+        assert!(desc.contains("="));
+        assert!(desc.contains("bad.exe"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_registry_14() {
+        let e = make_entry(14, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\reg.exe"), ("TargetObject", r"HKLM\Test")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:Registry]"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_net() {
+        let e = make_entry(3, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("Image", r"C:\app.exe"),
+                 ("SourceIp", "10.0.0.1"), ("SourcePort", "12345"),
+                 ("DestinationIp", "8.8.8.8"), ("DestinationPort", "53")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:Net]"));
+        assert!(desc.contains("8.8.8.8"));
+        assert!(desc.contains("53"));
+    }
+
+    #[test]
+    fn test_build_description_sysmon_remote_thread_v2() {
+        let e = make_entry(8, "Microsoft-Windows-Sysmon", "Sysmon/Operational",
+            vec![("SourceImage", r"C:\inject.exe"), ("TargetImage", r"C:\victim.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Sysmon:RemoteThread]"));
+        assert!(desc.contains("inject.exe"));
+        assert!(desc.contains("victim.exe"));
+    }
+
+    #[test]
+    fn test_build_description_wmi_no_query() {
+        let e = make_entry(5857, "WMI-Activity", "WMI-Activity/Operational", vec![]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[WMI:5857]"));
+    }
+
+    #[test]
+    fn test_build_description_defender_detection_threat_name_key() {
+        let e = make_entry(1116, "Defender", "Defender/Operational",
+            vec![("Threat Name", "Backdoor.Win32"), ("Path", r"C:\evil.exe")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Defender:Detection]"));
+        assert!(desc.contains("Backdoor.Win32"));
+        assert!(desc.contains("evil.exe"));
+    }
+
+    #[test]
+    fn test_build_description_rdp_client_1024() {
+        let e = make_entry(1024, "TerminalServices-RDPClient",
+            "Microsoft-Windows-TerminalServices-RDPClient/Operational",
+            vec![("Value", "remote-server")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[RDPClient]"));
+        assert!(desc.contains("Connecting to remote-server"));
+    }
+
+    #[test]
+    fn test_build_description_account_created_4720() {
+        let e = make_entry(4720, "Security", "Security",
+            vec![("TargetUserName", "newuser"),
+                 ("TargetDomainName", "DOMAIN"),
+                 ("SubjectUserName", "admin")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[AccountCreated]"));
+        assert!(desc.contains("DOMAIN"));
+        assert!(desc.contains("newuser"));
+    }
+
+    #[test]
+    fn test_build_description_share_5145() {
+        let e = make_entry(5145, "Security", "Security",
+            vec![("ShareName", r"\\*\ADMIN$"),
+                 ("RelativeTargetName", "System32"),
+                 ("SubjectUserName", "admin"),
+                 ("IpAddress", "192.168.1.1")]);
+        let desc = build_description(&e);
+        assert!(desc.contains("[Share]"));
+        assert!(desc.contains("ADMIN$"));
+    }
+
+    #[test]
+    fn test_parse_evtx_record_xml_empty() {
+        assert!(parse_evtx_record_xml("").is_none());
+    }
+
+    #[test]
+    fn test_parse_evtx_record_xml_malformed() {
+        assert!(parse_evtx_record_xml("<Event><broken").is_none());
+    }
+
+    #[test]
+    fn test_parse_evtx_record_xml_no_event_id() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <TimeCreated SystemTime="2025-06-15T10:30:00Z" />
+    <Computer>WS01</Computer>
+    <Channel>Security</Channel>
+  </System>
+</Event>"#;
+        assert!(parse_evtx_record_xml(xml).is_none());
+    }
+
+    #[test]
+    fn test_parse_evtx_record_xml_no_timestamp() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <EventID>4624</EventID>
+    <Computer>WS01</Computer>
+    <Channel>Security</Channel>
+  </System>
+</Event>"#;
+        assert!(parse_evtx_record_xml(xml).is_none());
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_invalid_no_z() {
+        // Has dot but no 'Z'
+        assert!(parse_evtx_timestamp("2025-06-15T10:30:00.1234567").is_none());
+    }
+
+    #[test]
+    fn test_parse_evtx_timestamp_short_frac() {
+        // 3-digit fractional seconds (valid RFC3339)
+        let ts = parse_evtx_timestamp("2025-06-15T10:30:00.123Z");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn test_map_4634_to_logoff() {
+        let e = make_entry(4634, "Security", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::UserLogoff);
+    }
+
+    #[test]
+    fn test_map_4688_to_process_create_v2() {
+        let e = make_entry(4688, "Security", "Security", vec![]);
+        assert_eq!(map_event_type(&e), EventType::ProcessCreate);
+    }
+
+    #[test]
+    fn test_map_7045_to_service_install_v2() {
+        let e = make_entry(7045, "SCM", "System", vec![]);
+        assert_eq!(map_event_type(&e), EventType::ServiceInstall);
+    }
+
+    #[test]
+    fn test_map_21_rdp_session_terminal_services() {
+        let e = make_entry(21, "Microsoft-Windows-TerminalServices-LocalSessionManager",
+            "TerminalServices", vec![]);
+        assert_eq!(map_event_type(&e), EventType::RdpSession);
+    }
+
+    #[test]
+    fn test_map_21_non_terminal_services() {
+        // EID 21 but not from TerminalServices provider -- should NOT be RdpSession
+        let e = make_entry(21, "SomeOtherProvider", "SomeChannel", vec![]);
+        let et = map_event_type(&e);
+        assert!(matches!(et, EventType::Other(_)));
+    }
 }

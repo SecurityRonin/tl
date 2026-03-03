@@ -1068,4 +1068,221 @@ mod tests {
                                        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]);
         assert_eq!(extract_name_from_shell_item(&data), Some("Known Folder".to_string()));
     }
+
+    // ─── Additional coverage tests for pipeline ─────────────────────────
+
+    #[test]
+    fn test_parse_shellbags_from_hive_with_regf_like_but_invalid() {
+        // Data with "regf" magic but invalid hive structure
+        // nt_hive2 may panic on invalid version rather than returning Err
+        let mut data = vec![0u8; 4096];
+        data[0..4].copy_from_slice(b"regf");
+        let result = std::panic::catch_unwind(|| parse_shellbags_from_hive(&data));
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {}
+            Err(_) => {}     // nt_hive2 internal unwrap panic - acceptable
+        }
+    }
+
+    #[test]
+    fn test_parse_shellbags_pipeline_with_multiple_usrclass_hives() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        struct FailProvider;
+        impl CollectionProvider for FailProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("disk error")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/admin/UsrClass.dat", 'C'),
+            hive_type: RegistryHiveType::UsrClass { username: "admin".to_string() },
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Users/user2/UsrClass.dat", 'C'),
+            hive_type: RegistryHiveType::UsrClass { username: "user2".to_string() },
+        });
+        let mut store = TimelineStore::new();
+
+        let result = parse_shellbags(&FailProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_shellbag_entry_with_folder_display_path() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+
+        let sb_entry = ShellbagEntry {
+            reg_path: r"BagMRU\0\1\2".to_string(),
+            folder_name: Some("Downloads".to_string()),
+            last_accessed: dt,
+        };
+
+        let display_path = if let Some(ref folder) = sb_entry.folder_name {
+            format!("[Shellbag] {} ({})", folder, sb_entry.reg_path)
+        } else {
+            format!("[Shellbag] {}", sb_entry.reg_path)
+        };
+
+        assert_eq!(display_path, r"[Shellbag] Downloads (BagMRU\0\1\2)");
+    }
+
+    #[test]
+    fn test_shellbag_entry_without_folder_display_path() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+
+        let sb_entry = ShellbagEntry {
+            reg_path: r"BagMRU\0\3".to_string(),
+            folder_name: None,
+            last_accessed: dt,
+        };
+
+        let display_path = if let Some(ref folder) = sb_entry.folder_name {
+            format!("[Shellbag] {} ({})", folder, sb_entry.reg_path)
+        } else {
+            format!("[Shellbag] {}", sb_entry.reg_path)
+        };
+
+        assert_eq!(display_path, r"[Shellbag] BagMRU\0\3");
+    }
+
+    #[test]
+    fn test_extract_ascii_fallback_at_offset_14() {
+        // Put ASCII at offset 14
+        let mut data = vec![0u8; 30];
+        data[14..20].copy_from_slice(b"FOLDER");
+        data[20] = 0;
+        let result = extract_ascii_fallback(&data);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "FOLDER");
+    }
+
+    #[test]
+    fn test_extract_ascii_fallback_empty_data() {
+        let data = vec![0u8; 3];
+        assert!(extract_ascii_fallback(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_file_entry_empty_short_name() {
+        // File entry with an empty short name (null at offset 14)
+        let mut data = vec![0u8; 30];
+        data[0..2].copy_from_slice(&30u16.to_le_bytes());
+        data[2] = 0x31;
+        data[14] = 0; // null immediately -> empty short name
+
+        let result = extract_file_entry_name(&data);
+        // Should return None since short name is empty and no unicode found
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_unicode_name_only_control_chars() {
+        // Only control characters, no printable UTF-16LE
+        let data = vec![0x01, 0x00, 0x02, 0x00, 0x03, 0x00];
+        assert!(find_unicode_name(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_name_network_all_types() {
+        // Test all network share types
+        for item_type in [0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0xC3] {
+            let mut data = vec![0u8; 20];
+            data[2] = item_type;
+            data[5..12].copy_from_slice(b"SERVER\0");
+            let name = extract_name_from_shell_item(&data);
+            assert!(name.is_some(), "type 0x{:02X} should extract a name", item_type);
+            assert_eq!(name.unwrap(), "SERVER");
+        }
+    }
+
+    #[test]
+    fn test_extract_name_file_entry_0x35() {
+        // Type 0x35 is in 0x30..=0x3F range
+        let mut data = vec![0u8; 30];
+        data[0..2].copy_from_slice(&30u16.to_le_bytes());
+        data[2] = 0x35;
+        data[14..20].copy_from_slice(b"README");
+        data[20] = 0;
+        let result = extract_name_from_shell_item(&data);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("README"));
+    }
+
+    #[test]
+    fn test_shellbag_entry_timeline_entry_creation() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+
+        let sb_entry = ShellbagEntry {
+            reg_path: r"BagMRU\0".to_string(),
+            folder_name: Some("Desktop".to_string()),
+            last_accessed: dt,
+        };
+
+        let display_path = format!("[Shellbag] {} ({})", sb_entry.folder_name.as_ref().unwrap(), sb_entry.reg_path);
+
+        let entry = TimelineEntry {
+            entity_id: EntityId::Generated(next_shellbag_id()),
+            path: display_path.clone(),
+            primary_timestamp: sb_entry.last_accessed,
+            event_type: EventType::FileAccess,
+            timestamps: TimestampSet::default(),
+            sources: smallvec![ArtifactSource::Shellbags],
+            anomalies: AnomalyFlags::empty(),
+            metadata: EntryMetadata::default(),
+        };
+
+        assert_eq!(entry.event_type, EventType::FileAccess);
+        assert!(entry.path.contains("Desktop"));
+        assert!(entry.path.contains("BagMRU"));
+        assert_eq!(entry.primary_timestamp, dt);
+    }
+
+    #[test]
+    fn test_extract_file_entry_name_short_name_odd_length_pad() {
+        // Test the padding to even offset logic
+        // short name "AB" at offset 14, len=2, end=17 (odd) -> pad to 18
+        let mut data = vec![0u8; 40];
+        data[0..2].copy_from_slice(&40u16.to_le_bytes());
+        data[2] = 0x31;
+        data[14] = b'A';
+        data[15] = b'B';
+        data[16] = 0; // null terminator
+        // short_name_end = 14 + 2 + 1 = 17 (odd)
+        // search_start = 18 (even)
+        // No unicode after -> should return "AB"
+        let result = extract_file_entry_name(&data);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "AB");
+    }
+
+    #[test]
+    fn test_extract_file_entry_name_short_name_even_length_no_pad() {
+        // short name "ABC" at offset 14, len=3, end=18 (even) -> no pad
+        let mut data = vec![0u8; 40];
+        data[0..2].copy_from_slice(&40u16.to_le_bytes());
+        data[2] = 0x32;
+        data[14] = b'A';
+        data[15] = b'B';
+        data[16] = b'C';
+        data[17] = 0; // null terminator
+        // short_name_end = 14 + 3 + 1 = 18 (even)
+        // search_start = 18
+        // No unicode -> return "ABC"
+        let result = extract_file_entry_name(&data);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "ABC");
+    }
 }

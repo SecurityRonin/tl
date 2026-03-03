@@ -68,7 +68,7 @@ impl CollectionProvider for VelociraptorProvider {
     }
 }
 
-fn classify_artifact(path: &NormalizedPath, manifest: &mut ArtifactManifest) {
+pub fn classify_artifact(path: &NormalizedPath, manifest: &mut ArtifactManifest) {
     let win = path.windows_path();
     let lower = win.to_lowercase();
 

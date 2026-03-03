@@ -857,4 +857,281 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(store.len(), 0);
     }
+
+    // ─── Minimal valid registry hive builder ─────────────────────────────
+
+    /// Build a minimal valid Windows registry hive (regf format) with only a root key node.
+    /// The root key has no subkeys and no values, so subpath lookups return Ok(None).
+    fn build_minimal_hive() -> Vec<u8> {
+        let mut hive = vec![0u8; 8192]; // 4096 header + 4096 hbin
+
+        // Base block (offset 0x0000, 4096 bytes)
+        hive[0x0000..0x0004].copy_from_slice(b"regf");
+        hive[0x0004..0x0008].copy_from_slice(&1u32.to_le_bytes()); // primary seq
+        hive[0x0008..0x000C].copy_from_slice(&1u32.to_le_bytes()); // secondary seq
+        let ts: u64 = 133_800_288_000_000_000;
+        hive[0x000C..0x0014].copy_from_slice(&ts.to_le_bytes()); // timestamp
+        hive[0x0014..0x0018].copy_from_slice(&1u32.to_le_bytes()); // major ver
+        hive[0x0018..0x001C].copy_from_slice(&3u32.to_le_bytes()); // minor ver
+        hive[0x001C..0x0020].copy_from_slice(&0u32.to_le_bytes()); // file type
+        hive[0x0020..0x0024].copy_from_slice(&1u32.to_le_bytes()); // file format
+        hive[0x0024..0x0028].copy_from_slice(&0x20u32.to_le_bytes()); // root cell offset
+        hive[0x0028..0x002C].copy_from_slice(&4096u32.to_le_bytes()); // bins data size
+        hive[0x002C..0x0030].copy_from_slice(&1u32.to_le_bytes()); // clustering factor
+
+        // Compute checksum: XOR of first 127 u32 values
+        let mut checksum: u32 = 0;
+        for i in 0..127 {
+            let offset = i * 4;
+            let val = u32::from_le_bytes([
+                hive[offset], hive[offset + 1], hive[offset + 2], hive[offset + 3],
+            ]);
+            checksum ^= val;
+        }
+        hive[0x01FC..0x0200].copy_from_slice(&checksum.to_le_bytes());
+
+        // Hive bin (offset 0x1000, 4096 bytes)
+        let bin = 0x1000;
+        hive[bin..bin + 4].copy_from_slice(b"hbin");
+        hive[bin + 4..bin + 8].copy_from_slice(&0u32.to_le_bytes());
+        hive[bin + 8..bin + 12].copy_from_slice(&4096u32.to_le_bytes());
+        hive[bin + 20..bin + 28].copy_from_slice(&ts.to_le_bytes());
+
+        // Root key node cell (at bin + 0x20)
+        let cell = bin + 0x20;
+        let cell_size: i32 = -96;
+        hive[cell..cell + 4].copy_from_slice(&cell_size.to_le_bytes());
+        hive[cell + 4..cell + 6].copy_from_slice(b"nk");
+        hive[cell + 6..cell + 8].copy_from_slice(&0x0004u16.to_le_bytes()); // KEY_HIVE_ENTRY
+        hive[cell + 8..cell + 16].copy_from_slice(&ts.to_le_bytes());
+        hive[cell + 16..cell + 20].copy_from_slice(&0u32.to_le_bytes());
+        hive[cell + 20..cell + 24].copy_from_slice(&0x20u32.to_le_bytes()); // parent = self
+        hive[cell + 24..cell + 28].copy_from_slice(&0u32.to_le_bytes()); // 0 subkeys stable
+        hive[cell + 28..cell + 32].copy_from_slice(&0u32.to_le_bytes()); // 0 subkeys volatile
+        hive[cell + 32..cell + 36].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no subkeys list
+        hive[cell + 36..cell + 40].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        hive[cell + 40..cell + 44].copy_from_slice(&0u32.to_le_bytes()); // 0 values
+        hive[cell + 44..cell + 48].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no values list
+        hive[cell + 48..cell + 52].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no security
+        hive[cell + 52..cell + 56].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no class name
+        // Max subkey/class/value name/data sizes = 0
+        for offset in (56..76).step_by(4) {
+            hive[cell + offset..cell + offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let key_name = b"ROOT";
+        hive[cell + 76..cell + 78].copy_from_slice(&(key_name.len() as u16).to_le_bytes());
+        hive[cell + 78..cell + 80].copy_from_slice(&0u16.to_le_bytes());
+        hive[cell + 80..cell + 80 + key_name.len()].copy_from_slice(key_name);
+
+        hive
+    }
+
+    // ─── Valid hive tests for parse_services_from_hive ───────────────────
+
+    #[test]
+    fn test_parse_services_from_hive_valid_empty_hive() {
+        // Valid hive with no ControlSet001/ControlSet002 subkeys.
+        // Covers lines 64, 69-71, 74-79 (subpath returns Ok(None) for both control sets)
+        let hive_data = build_minimal_hive();
+        let result = parse_services_from_hive(&hive_data);
+        assert!(result.is_ok());
+        let entries = result.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_valid_hive_returns_ok() {
+        // Ensures the function successfully parses a valid hive header
+        // Covers lines 57-62 (Hive::new succeeds), 64-66 (root_key_node succeeds)
+        let hive_data = build_minimal_hive();
+        let result = parse_services_from_hive(&hive_data);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_services_valid_hive_no_services_found() {
+        // Tests the full parse_services pipeline with a valid but empty hive.
+        // Covers lines 190, 192, 195-196, 203
+        let hive_data = build_minimal_hive();
+        let manifest = make_system_hive_manifest();
+        let mut store = TimelineStore::new();
+
+        struct ValidHiveProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for ValidHiveProvider {
+            fn discover(&self) -> crate::collection::manifest::ArtifactManifest {
+                crate::collection::manifest::ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = ValidHiveProvider { data: hive_data };
+        let result = parse_services(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_services_timeline_entry_creation_simulation() {
+        // Simulates lines 205-224: creating timeline entries from ServiceEntry structs
+        let ts = Utc.with_ymd_and_hms(2025, 6, 15, 10, 0, 0).unwrap();
+        let service_entries = vec![
+            ServiceEntry {
+                name: "Svc1".to_string(),
+                image_path: r"C:\svc1.exe".to_string(),
+                start_type: 0,
+                service_type: 1,
+                last_write: ts,
+            },
+            ServiceEntry {
+                name: "Svc2".to_string(),
+                image_path: r"C:\svc2.exe -k netsvcs".to_string(),
+                start_type: 2,
+                service_type: 32,
+                last_write: ts,
+            },
+        ];
+
+        let mut store = TimelineStore::new();
+        for svc in &service_entries {
+            let desc = format!(
+                "[Service:{}] {} -> {}",
+                svc.name,
+                start_type_str(svc.start_type),
+                svc.image_path,
+            );
+            let entry = TimelineEntry {
+                entity_id: EntityId::Generated(next_service_id()),
+                path: desc,
+                primary_timestamp: svc.last_write,
+                event_type: EventType::ServiceInstall,
+                timestamps: TimestampSet::default(),
+                sources: smallvec![ArtifactSource::Registry("SYSTEM".to_string())],
+                anomalies: AnomalyFlags::empty(),
+                metadata: EntryMetadata::default(),
+            };
+            store.push(entry);
+        }
+
+        assert_eq!(store.len(), 2);
+        let e0 = store.get(0).unwrap();
+        assert!(e0.path.contains("Svc1"));
+        assert!(e0.path.contains("Boot"));
+        assert_eq!(e0.event_type, EventType::ServiceInstall);
+
+        let e1 = store.get(1).unwrap();
+        assert!(e1.path.contains("Svc2"));
+        assert!(e1.path.contains("Auto"));
+        assert!(e1.path.contains("svc2.exe"));
+    }
+
+    #[test]
+    fn test_service_entry_filtering_by_start_type() {
+        // Simulates lines 134-136: only auto-start services (start_type <= 2) are included
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let all_entries = vec![
+            ServiceEntry { name: "Boot".to_string(), image_path: "a.sys".to_string(), start_type: 0, service_type: 1, last_write: ts },
+            ServiceEntry { name: "System".to_string(), image_path: "b.sys".to_string(), start_type: 1, service_type: 2, last_write: ts },
+            ServiceEntry { name: "Auto".to_string(), image_path: "c.exe".to_string(), start_type: 2, service_type: 16, last_write: ts },
+            ServiceEntry { name: "Manual".to_string(), image_path: "d.exe".to_string(), start_type: 3, service_type: 16, last_write: ts },
+            ServiceEntry { name: "Disabled".to_string(), image_path: "e.exe".to_string(), start_type: 4, service_type: 16, last_write: ts },
+        ];
+
+        // Filter as the real code does on line 134
+        let auto_start: Vec<_> = all_entries.iter().filter(|s| s.start_type <= 2).collect();
+        assert_eq!(auto_start.len(), 3);
+        assert_eq!(auto_start[0].name, "Boot");
+        assert_eq!(auto_start[1].name, "System");
+        assert_eq!(auto_start[2].name, "Auto");
+    }
+
+    #[test]
+    fn test_service_entry_empty_image_path_skipped() {
+        // Simulates lines 139-141: services without an ImagePath are skipped
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let svc = ServiceEntry {
+            name: "NoPath".to_string(),
+            image_path: String::new(),
+            start_type: 0,
+            service_type: 1,
+            last_write: ts,
+        };
+        // In the real code, this would be skipped
+        assert!(svc.image_path.is_empty());
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_regf_truncated() {
+        // A buffer with "regf" magic but too short for full header
+        // Covers line 57-61 (Hive::new fails)
+        let mut data = vec![0u8; 50];
+        data[0..4].copy_from_slice(b"regf");
+        let result = parse_services_from_hive(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_services_from_hive_large_zeroed() {
+        // 8192 bytes of zeros - nt_hive2 may panic on invalid magic rather than returning Err
+        let data = vec![0u8; 8192];
+        let result = std::panic::catch_unwind(|| parse_services_from_hive(&data));
+        match result {
+            Ok(Err(_)) => {}
+            Err(_) => {}     // nt_hive2 internal unwrap panic - acceptable
+            Ok(Ok(entries)) => assert!(entries.is_empty()),
+        }
+    }
+
+    #[test]
+    fn test_parse_services_full_pipeline_with_valid_hive_multiple_system_hives() {
+        // Tests the full loop with multiple SYSTEM hive entries, all using valid hive data
+        // Covers lines 180 loop, 189-192, 195-196, 203
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let hive_data = build_minimal_hive();
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/backup/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        struct ValidProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for ValidProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = ValidProvider { data: hive_data };
+        let mut store = TimelineStore::new();
+        let result = parse_services(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
 }

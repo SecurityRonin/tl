@@ -834,4 +834,192 @@ mod tests {
         // After strip_prefix, rest is "" which has no backslash
         assert_eq!(result, path);
     }
+
+    // ─── Minimal valid hive tests ─────────────────────────────────────────
+
+    /// Build a minimal valid Windows registry hive binary.
+    /// The hive contains a root key node with 0 subkeys and 0 values.
+    /// This is sufficient to exercise code that opens a hive and navigates
+    /// subpaths (which will return Ok(None) for missing paths).
+    fn build_minimal_hive() -> Vec<u8> {
+        let mut hive = vec![0u8; 4096 + 4096]; // base block + one hive bin
+
+        // ─── Base Block (4096 bytes) ─────────────────────────────────────
+        // Offset 0x00: magic "regf"
+        hive[0..4].copy_from_slice(b"regf");
+        // Offset 0x04: primary_sequence_number
+        hive[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // Offset 0x08: secondary_sequence_number
+        hive[8..12].copy_from_slice(&1u32.to_le_bytes());
+        // Offset 0x0C: timestamp (u64)
+        hive[12..20].copy_from_slice(&0u64.to_le_bytes());
+        // Offset 0x14: major_version = 1
+        hive[20..24].copy_from_slice(&1u32.to_le_bytes());
+        // Offset 0x18: minor_version = 5
+        hive[24..28].copy_from_slice(&5u32.to_le_bytes());
+        // Offset 0x1C: file_type = 0 (HiveFile)
+        hive[28..32].copy_from_slice(&0u32.to_le_bytes());
+        // Offset 0x20: file_format = 1
+        hive[32..36].copy_from_slice(&1u32.to_le_bytes());
+        // Offset 0x24: root_cell_offset = 0x20 (32 bytes into hive bins data)
+        hive[36..40].copy_from_slice(&0x20u32.to_le_bytes());
+        // Offset 0x28: data_size = 0x1000 (4096, one hive bin)
+        hive[40..44].copy_from_slice(&0x1000u32.to_le_bytes());
+        // Offset 0x2C: clustering_factor = 1
+        hive[44..48].copy_from_slice(&1u32.to_le_bytes());
+        // Offset 0x30-0x8F: file_name (64 bytes of UTF-16LE), leave as zeros
+        // Remaining header fields up to 0x1FB: zeros are fine
+        // Offset 0x1FC: checksum = XOR of first 127 u32s
+        let mut checksum: u32 = 0;
+        for i in 0..127 {
+            let off = i * 4;
+            let val = u32::from_le_bytes([hive[off], hive[off+1], hive[off+2], hive[off+3]]);
+            checksum ^= val;
+        }
+        if checksum == 0xFFFF_FFFF { checksum = 0xFFFF_FFFE; }
+        if checksum == 0 { checksum = 1; }
+        hive[0x1FC..0x200].copy_from_slice(&checksum.to_le_bytes());
+
+        // ─── Hive Bin (4096 bytes, starting at offset 4096) ──────────────
+        let hbin_off = 4096;
+        // hbin magic
+        hive[hbin_off..hbin_off+4].copy_from_slice(b"hbin");
+        // offset of this hive bin = 0
+        hive[hbin_off+4..hbin_off+8].copy_from_slice(&0u32.to_le_bytes());
+        // size of this hive bin = 0x1000 (4096)
+        hive[hbin_off+8..hbin_off+12].copy_from_slice(&0x1000u32.to_le_bytes());
+        // reserved (u64) = 0
+        hive[hbin_off+12..hbin_off+20].copy_from_slice(&0u64.to_le_bytes());
+        // timestamp (u64) = 0
+        hive[hbin_off+20..hbin_off+28].copy_from_slice(&0u64.to_le_bytes());
+        // spare (u32) = 0
+        hive[hbin_off+28..hbin_off+32].copy_from_slice(&0u32.to_le_bytes());
+
+        // ─── Root Cell at hbin_off + 0x20 (= root_cell_offset 0x20) ─────
+        // The root_cell_offset in base block is relative to start of hive bins data.
+        // Hive bins data starts right after base block. The hive bin header is 32 bytes.
+        // So root cell is at hbin_off + 32 = hbin_off + 0x20.
+        let cell_off = hbin_off + 0x20;
+        // Cell header: size as negative i32 (allocated).
+        // We need enough space for the nk record. nk record is:
+        //   2 bytes magic "nk" + 2 bytes flags + 8 bytes timestamp + 4 bytes access_bits
+        //   + 4 bytes parent + 4 bytes subkey_count + 4 bytes volatile_subkey_count
+        //   + 4 bytes subkeys_list_offset + 4 bytes volatile_subkeys_list_offset
+        //   + 4 bytes key_values_count + (conditional key_values_list ptr)
+        //   + 4 bytes key_values_list_offset + 4 bytes key_security_offset
+        //   + 4 bytes class_name_offset + 4 bytes max_subkey_name
+        //   + 4 bytes max_subkey_class_name + 4 bytes max_value_name
+        //   + 4 bytes max_value_data + 4 bytes work_var
+        //   + 2 bytes key_name_length + 2 bytes class_name_length
+        //   + key_name_string bytes
+        // Total nk fields (without key_name): 2+2+8+4+4+4+4+4+4+4+4+4+4+4+4+4+4+4+2+2 = 76 bytes
+        // Plus "nk" magic is inside the Cell content. Cell header is 4 bytes.
+        // Total cell: 4 (header) + 76 + key_name_length, aligned to 8.
+        // With root key name "CMI-CreateHive{2A7FB991-7BBE-4F9D-B91E-7CB54597B9B0}" that's a long name.
+        // We'll use a short name like "root" (4 bytes). Total = 4+76+4 = 84, aligned to 88.
+        let key_name = b"root";
+        let key_name_len = key_name.len() as u16;
+        let nk_content_size = 76 + key_name_len as usize;
+        let cell_size = 4 + nk_content_size; // 4 for header
+        let aligned_cell_size = (cell_size + 7) & !7; // align to 8
+        let cell_size_i32 = -(aligned_cell_size as i32); // negative = allocated
+        hive[cell_off..cell_off+4].copy_from_slice(&cell_size_i32.to_le_bytes());
+
+        let nk_off = cell_off + 4; // after cell header
+        // "nk" magic
+        hive[nk_off..nk_off+2].copy_from_slice(b"nk");
+        // flags (u16): KEY_HIVE_ENTRY = 0x0004 (root key flag)
+        hive[nk_off+2..nk_off+4].copy_from_slice(&0x0024u16.to_le_bytes()); // KEY_HIVE_ENTRY | KEY_COMP_NAME
+        // timestamp (8 bytes): a valid FILETIME
+        let filetime: u64 = 132500000000000000; // ~2020-12-01
+        hive[nk_off+4..nk_off+12].copy_from_slice(&filetime.to_le_bytes());
+        // access_bits (u32)
+        hive[nk_off+12..nk_off+16].copy_from_slice(&0u32.to_le_bytes());
+        // parent offset (u32): 0xFFFFFFFF (no parent for root)
+        hive[nk_off+16..nk_off+20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // subkey_count (u32) = 0
+        hive[nk_off+20..nk_off+24].copy_from_slice(&0u32.to_le_bytes());
+        // volatile_subkey_count (u32) = 0
+        hive[nk_off+24..nk_off+28].copy_from_slice(&0u32.to_le_bytes());
+        // subkeys_list_offset (u32) = 0xFFFFFFFF (none)
+        hive[nk_off+28..nk_off+32].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // volatile_subkeys_list_offset (u32) = 0xFFFFFFFF
+        hive[nk_off+32..nk_off+36].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // key_values_count (u32) = 0
+        hive[nk_off+36..nk_off+40].copy_from_slice(&0u32.to_le_bytes());
+        // key_values_list_offset (u32) = 0xFFFFFFFF (none, but this is temp/conditional)
+        hive[nk_off+40..nk_off+44].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // key_security_offset (u32) = 0xFFFFFFFF
+        hive[nk_off+44..nk_off+48].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // class_name_offset (u32) = 0xFFFFFFFF
+        hive[nk_off+48..nk_off+52].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // max_subkey_name (u32) = 0
+        hive[nk_off+52..nk_off+56].copy_from_slice(&0u32.to_le_bytes());
+        // max_subkey_class_name (u32) = 0
+        hive[nk_off+56..nk_off+60].copy_from_slice(&0u32.to_le_bytes());
+        // max_value_name (u32) = 0
+        hive[nk_off+60..nk_off+64].copy_from_slice(&0u32.to_le_bytes());
+        // max_value_data (u32) = 0
+        hive[nk_off+64..nk_off+68].copy_from_slice(&0u32.to_le_bytes());
+        // work_var (u32) = 0
+        hive[nk_off+68..nk_off+72].copy_from_slice(&0u32.to_le_bytes());
+        // key_name_length (u16)
+        hive[nk_off+72..nk_off+74].copy_from_slice(&key_name_len.to_le_bytes());
+        // class_name_length (u16) = 0
+        hive[nk_off+74..nk_off+76].copy_from_slice(&0u16.to_le_bytes());
+        // key_name_string (ASCII since KEY_COMP_NAME flag is set)
+        hive[nk_off+76..nk_off+76+key_name.len()].copy_from_slice(key_name);
+
+        hive
+    }
+
+    #[test]
+    fn test_parse_bam_from_hive_valid_hive_no_bam_keys() {
+        // A valid hive with a root key but no BAM/DAM subkeys.
+        // parse_bam_from_hive should succeed with 0 entries.
+        let hive_data = build_minimal_hive();
+        let result = parse_bam_from_hive(&hive_data);
+        assert!(result.is_ok(), "parse_bam_from_hive failed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_bam_pipeline_with_valid_empty_hive() {
+        use crate::collection::manifest::{ArtifactManifest, RegistryHiveEntry, RegistryHiveType};
+        use crate::collection::path::NormalizedPath;
+
+        let hive_data = build_minimal_hive();
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.registry_hives.push(RegistryHiveEntry {
+            path: NormalizedPath::from_image_path("/Windows/System32/config/SYSTEM", 'C'),
+            hive_type: RegistryHiveType::System,
+        });
+
+        let mut store = TimelineStore::new();
+
+        struct ValidHiveProvider {
+            data: Vec<u8>,
+        }
+        impl CollectionProvider for ValidHiveProvider {
+            fn discover(&self) -> ArtifactManifest {
+                ArtifactManifest::default()
+            }
+            fn open_file(
+                &self,
+                _path: &crate::collection::path::NormalizedPath,
+            ) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let provider = ValidHiveProvider { data: hive_data };
+        let result = parse_bam(&provider, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Valid hive but no BAM keys, so 0 entries
+        assert_eq!(store.len(), 0);
+    }
 }

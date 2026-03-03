@@ -1237,4 +1237,338 @@ mod tests {
         assert!(info.target_path.is_none());
         assert!(info.volume_serial.is_none());
     }
+
+    // ─── Pipeline tests for parse_lnk_files ─────────────────────────────
+
+    fn make_lnk_manifest() -> ArtifactManifest {
+        use crate::collection::path::NormalizedPath;
+        let mut manifest = ArtifactManifest::default();
+        manifest.lnk_files.push(
+            NormalizedPath::from_image_path(r"/Users/test/Recent/doc.lnk", 'C'),
+        );
+        manifest
+    }
+
+    #[test]
+    fn test_parse_lnk_files_open_file_error() {
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct FailOpenProvider;
+        impl CollectionProvider for FailOpenProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                anyhow::bail!("Cannot read LNK file")
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&FailOpenProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_too_large() {
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct HugeProvider;
+        impl CollectionProvider for HugeProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(vec![0u8; MAX_LNK_SIZE + 1])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&HugeProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_invalid_data() {
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct GarbageProvider;
+        impl CollectionProvider for GarbageProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(vec![0xFFu8; 512])
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&GarbageProvider, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_no_timestamps() {
+        // LNK with all zero timestamps -> skipped (no usable timestamps)
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        let lnk_data = build_lnk_header(0, 0, 0, 100, 0);
+
+        struct ZeroTsProvider { data: Vec<u8> }
+        impl CollectionProvider for ZeroTsProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&ZeroTsProvider { data: lnk_data }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_valid_lnk_creates_entry() {
+        use chrono::TimeZone;
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let accessed = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+
+        let lnk_data = build_lnk_header(
+            datetime_to_filetime(created),
+            datetime_to_filetime(accessed),
+            datetime_to_filetime(written),
+            5000,
+            0,
+        );
+
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct LnkDataProvider { data: Vec<u8> }
+        impl CollectionProvider for LnkDataProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&LnkDataProvider { data: lnk_data }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_with_tracker_data_in_path() {
+        use chrono::TimeZone;
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+
+        let mut lnk_data = build_lnk_header(
+            datetime_to_filetime(written),
+            datetime_to_filetime(written),
+            datetime_to_filetime(written),
+            1000,
+            HAS_LINK_INFO,
+        );
+
+        // Minimal LinkInfo with local base path
+        let target_path = b"C:\\test\\file.txt\0";
+        let volume_id_size = 16u32;
+        let local_base_path_offset = 28u32 + volume_id_size;
+        let link_info_size = local_base_path_offset as usize + target_path.len();
+
+        lnk_data.extend_from_slice(&(link_info_size as u32).to_le_bytes());
+        lnk_data.extend_from_slice(&28u32.to_le_bytes());
+        lnk_data.extend_from_slice(&0x01u32.to_le_bytes());
+        lnk_data.extend_from_slice(&28u32.to_le_bytes());
+        lnk_data.extend_from_slice(&local_base_path_offset.to_le_bytes());
+        lnk_data.extend_from_slice(&0u32.to_le_bytes());
+        lnk_data.extend_from_slice(&0u32.to_le_bytes());
+
+        lnk_data.extend_from_slice(&volume_id_size.to_le_bytes());
+        lnk_data.extend_from_slice(&3u32.to_le_bytes());
+        lnk_data.extend_from_slice(&0xABCDu32.to_le_bytes());
+        lnk_data.extend_from_slice(&0u32.to_le_bytes());
+
+        lnk_data.extend_from_slice(target_path);
+
+        // TrackerDataBlock
+        let mac = [0x08, 0x00, 0x27, 0xAB, 0xCD, 0xEF];
+        lnk_data.extend_from_slice(&build_tracker_block("FORENSIC-PC", mac));
+        lnk_data.extend_from_slice(&0u32.to_le_bytes()); // terminal block
+
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct LnkProvider { data: Vec<u8> }
+        impl CollectionProvider for LnkProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&LnkProvider { data: lnk_data }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_multiple_files_mixed() {
+        use crate::collection::path::NormalizedPath;
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.lnk_files.push(
+            NormalizedPath::from_image_path(r"/Users/test/Recent/doc.lnk", 'C'),
+        );
+        manifest.lnk_files.push(
+            NormalizedPath::from_image_path(r"/Users/test/Recent/fail.lnk", 'C'),
+        );
+
+        let valid_lnk = build_lnk_header(
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            datetime_to_filetime(dt),
+            100,
+            0,
+        );
+
+        let mut store = TimelineStore::new();
+
+        // Use a provider that returns valid data for first call, error for second
+        struct MixedProvider { valid: Vec<u8> }
+        impl CollectionProvider for MixedProvider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                if path.to_string().contains("fail") {
+                    anyhow::bail!("disk error")
+                }
+                Ok(self.valid.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&MixedProvider { valid: valid_lnk }, &manifest, &mut store);
+        assert!(result.is_ok());
+        // Only the valid LNK should produce an entry
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_modified_only_timestamp() {
+        use chrono::TimeZone;
+        let written = Utc.with_ymd_and_hms(2025, 3, 1, 8, 30, 0).unwrap();
+
+        // Only write time set, created and accessed zero
+        let lnk_data = build_lnk_header(
+            0,
+            0,
+            datetime_to_filetime(written),
+            100,
+            0,
+        );
+
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct Provider { data: Vec<u8> }
+        impl CollectionProvider for Provider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&Provider { data: lnk_data }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_accessed_only_timestamp() {
+        use chrono::TimeZone;
+        let accessed = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+
+        // Only access time set
+        let lnk_data = build_lnk_header(
+            0,
+            datetime_to_filetime(accessed),
+            0,
+            100,
+            0,
+        );
+
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct Provider { data: Vec<u8> }
+        impl CollectionProvider for Provider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&Provider { data: lnk_data }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+    }
+
+    #[test]
+    fn test_parse_lnk_files_created_only_timestamp() {
+        use chrono::TimeZone;
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+
+        // Only creation time set
+        let lnk_data = build_lnk_header(
+            datetime_to_filetime(created),
+            0,
+            0,
+            100,
+            0,
+        );
+
+        let manifest = make_lnk_manifest();
+        let mut store = TimelineStore::new();
+
+        struct Provider { data: Vec<u8> }
+        impl CollectionProvider for Provider {
+            fn discover(&self) -> ArtifactManifest { ArtifactManifest::default() }
+            fn open_file(&self, _path: &crate::collection::path::NormalizedPath) -> Result<Vec<u8>> {
+                Ok(self.data.clone())
+            }
+            fn metadata(&self) -> crate::collection::provider::CollectionMetadata {
+                crate::collection::provider::CollectionMetadata::default()
+            }
+        }
+
+        let result = parse_lnk_files(&Provider { data: lnk_data }, &manifest, &mut store);
+        assert!(result.is_ok());
+        assert!(store.len() >= 1);
+    }
 }
