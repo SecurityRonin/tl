@@ -5,8 +5,8 @@ use smallvec::smallvec;
 use crate::timeline::entry::*;
 use crate::timeline::store::TimelineStore;
 
-// Re-export core USN types from the usnjrnl crate.
-pub use usnjrnl::usn::{
+// Re-export core USN types from the usnjrnl-forensic crate.
+pub use usnjrnl_forensic::usn::{
     parse_usn_journal, FileAttributes, UsnJournalReader, UsnReason, UsnRecord,
 };
 

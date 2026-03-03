@@ -18,7 +18,7 @@ percent-encoding = "2"
 # NTFS
 mft = "0.6"
 ntfs = "0.4"
-usnjrnl = { git = "https://github.com/SecurityRonin/usnjrnl.git" }
+usnjrnl-forensic = { git = "https://github.com/SecurityRonin/usnjrnl-forensic.git" }
 
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
