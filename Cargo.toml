@@ -3,6 +3,9 @@ name = "tl"
 version = "0.1.0"
 edition = "2021"
 description = "Rapid forensic triage timeline tool"
+license = "MIT"
+repository = "https://github.com/SecurityRonin/tl"
+authors = ["Albert Hui"]
 
 [dependencies]
 # CLI

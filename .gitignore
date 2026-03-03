@@ -1,5 +1,7 @@
 test
 .attic
+.serena
+tarpaulin-report.json
 
 # Rust / Cargo
 /target

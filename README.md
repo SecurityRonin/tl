@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-445-green.svg)](https://github.com/h4x0r/tl)
+[![Tests](https://img.shields.io/badge/tests-1743-green.svg)](https://github.com/SecurityRonin/tl)
 
 **Author:** Albert Hui ([@h4x0r](https://github.com/h4x0r)) of [@SecurityRonin](https://github.com/SecurityRonin)
 
@@ -201,8 +201,8 @@ The unified timeline normalizes entries into these event types:
 ## Testing
 
 ```bash
-cargo test        # 445 tests across all modules
-cargo test --lib  # 390 unit tests
+cargo test        # 1743 tests across all modules
+cargo test --lib  # 1688 unit tests
 ```
 
 ## License
