@@ -11,14 +11,15 @@ authors = ["Albert Hui"]
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Collection handling
-zip = "2"
+# Collection handling — our pure-Rust, no-C-FFI ZIP reader (drop-in for the
+# read-only zip API via the `zip` package rename). See zip-forensic-core.
+zip = { version = "0.1", package = "zip-forensic-core" }
 percent-encoding = "2"
 
 # NTFS
 mft = "0.6"
 ntfs = "0.4"
-usnjrnl-forensic = { git = "https://github.com/SecurityRonin/usnjrnl-forensic.git" }
+usnjrnl-forensic = "0.1"
 
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
